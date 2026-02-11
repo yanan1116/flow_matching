@@ -1,41 +1,8 @@
 #!/usr/bin/env python
-#
-# Copyright (c) 2024, Honda Research Institute Europe GmbH
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
-#
-# 1. Redistributions of source code must retain the above copyright notice,
-#  this list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright
-#  notice, this list of conditions and the following disclaimer in the
-#  documentation and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#  contributors may be used to endorse or promote products derived from
-#  this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
-# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
-# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# This notebook is an example of "Affordance-based Robot Manipulation with Flow Matching" https://arxiv.org/abs/2409.01083
-
-import sys
-import time
-
+import sys,random,time
 sys.dont_write_bytecode = True
-sys.path.append('../models')
+sys.path.append('./external/models')
+sys.path.append('./external')
 import os
 import matplotlib.pyplot as plt
 import numpy as np
@@ -57,18 +24,49 @@ from skvideo.io import vwrite
 from torchcfm.conditional_flow_matching import *
 from torchcfm.utils import *
 from torchcfm.models.models import *
+import pygame,h5py,argparse
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+assert torch.cuda.is_available()
+device = 'cuda'
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+        "--frozen_vision",
+        action='store_true',
+    )
+parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=300,
+)
+
+parser.add_argument(
+    "--n_test",
+    type=int,
+    default=100,
+) 
+
+parser.add_argument(
+    "--num_epochs",
+    type=int,
+    default=10000,
+) 
+
+parser.add_argument(
+    "--eval_interval",
+    type=int,
+    default=100,
+) 
+
+args = parser.parse_args() 
 
 ##################################
-dataset_path = "pusht_cchi_v7_replay.zarr.zip"
-
+dataset_path = "./pusht/pusht_cchi_v7_replay.zarr"
+PATH_TMP = './checkpoints/pusht/cp-tmp.pth'
 obs_horizon = 1
 pred_horizon = 16
 action_dim = 2
 action_horizon = 8
-num_epochs = 3001
 vision_feature_dim = 514
 
 # create dataset from file
@@ -86,13 +84,17 @@ stats = dataset.stats
 dataloader = DataLoader(
     dataset,
     batch_size=64,
-    num_workers=4,
+    num_workers=16,
     shuffle=True,
     # accelerate cpu-gpu transfer
     pin_memory=True,
     # don't kill worker process afte each epoch
     persistent_workers=True
 )
+
+
+print("Num samples:", len(dataset))
+print("Num batches:", len(dataloader))
 
 ##################################################################
 # create network object
@@ -109,92 +111,45 @@ nets = nn.ModuleDict({
     'noise_pred_net': noise_pred_net
 }).to(device)
 
+if args.frozen_vision:
+    nets['vision_encoder'].eval()  # important: disable GN/Dropout behavior changes
+    for p in nets['vision_encoder'].parameters():
+        p.requires_grad = False
+        
 ##################################################################
 sigma = 0.0
-ema = EMAModel(
-    parameters=nets.parameters(),
-    power=0.75)
-optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4, weight_decay=1e-6)
+# ema_params = list(nets.parameters())
+ema_params = [p for p in nets.parameters() if p.requires_grad]
+ema = EMAModel(parameters=ema_params, power=0.75)
+
+# trainable_params = [p for p in nets.parameters() if p.requires_grad]
+
+optimizer = torch.optim.AdamW(params=ema_params, lr=1e-4,weight_decay=1e-6)
+
+# optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4, weight_decay=1e-6)
 lr_scheduler = get_scheduler(
     name='cosine',
     optimizer=optimizer,
     num_warmup_steps=500,
-    num_training_steps=len(dataloader) * num_epochs
+    num_training_steps=len(dataloader) * args.num_epochs
 )
 
 FM = ConditionalFlowMatcher(sigma=sigma)
-avg_loss_train_list = []
-avg_loss_val_list = []
 
-########################################################################
-#### Train the model
-for epoch in range(0, num_epochs):
-    total_loss_train = 0.0
-    for data in tqdm(dataloader):
-        x_img = data['image'][:, :obs_horizon].to(device)
-        x_pos = data['agent_pos'][:, :obs_horizon].to(device)
-        x_traj = data['action'].to(device)
+def evaluation_rollouts(epoch, nets):
+    # epoch = 500
+    # PATH = f'./checkpoints/pusht/cp-{epoch}.pth'
+    state_dict = torch.load(PATH_TMP, map_location='cuda')
+    ema_nets = nets
+    ema_nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
+    ema_nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
 
-        x_traj = x_traj.float()
-        x0 = torch.randn(x_traj.shape, device=device)
-        timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
-
-        # encoder vision features
-        image_features = nets['vision_encoder'](x_img.flatten(end_dim=1))
-        image_features = image_features.reshape(*x_img.shape[:2], -1)
-        obs_features = torch.cat([image_features, x_pos], dim=-1)
-        # obs_cond = obs_features.flatten(start_dim=1)
-        obs_cond = obs_features
-
-        vt = nets['noise_pred_net'](xt, timestep, obs_cond)
-
-        loss = torch.mean((vt - ut) ** 2)
-        total_loss_train += loss.detach()
-
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-        lr_scheduler.step()
-
-        # update Exponential Moving Average of the model weights
-        ema.step(nets.parameters())
-
-    avg_loss_train = total_loss_train / len(dataloader)
-    avg_loss_train_list.append(avg_loss_train.detach().cpu().numpy())
-    print(colored(f"epoch: {epoch:>02},  loss_train: {avg_loss_train:.10f}", 'yellow'))
-
-    if epoch % 1000 == 0:
-        ema.copy_to(nets.parameters())
-        PATH = './flow_ema_%05d.pth' % epoch
-        torch.save({'vision_encoder': nets.vision_encoder.state_dict(),
-                    'noise_pred_net': nets.noise_pred_net.state_dict(),
-                    'epoch': epoch,
-                    'ema': ema.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict()
-                    }, PATH)
-        ema.restore(nets.parameters())
-
-sys.exit(0)
-
-########################################################################
-###### test the model
-PATH = './flow_ema_trans_03000.pth'
-state_dict = torch.load(PATH, map_location='cuda')
-ema_nets = nets
-ema_nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-ema_nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
-
-test_start_seed = 1000
-n_test = 500
-
-max_steps = 300
-env = pusht.PushTImageEnv()
-
-for epoch in range(n_test):
-    seed = test_start_seed + epoch
-
-    for pp in range(10):
+    env = pusht.PushTImageEnv()
+    n_success = 0
+    for trail_ix in range(args.n_test):
+        print(f'do eval at trail:{trail_ix}')
+        # seed = random.randint(1, 10000)
+        seed = 1000 + trail_ix
         env.seed(seed)
 
         obs, info = env.reset()
@@ -205,7 +160,8 @@ for epoch in range(n_test):
         done = False
         step_idx = 0
 
-        with tqdm(total=max_steps, desc="Eval PushTImageEnv") as pbar:
+        with tqdm(total=args.max_steps, disable=True, desc="Eval PushTImageEnv") as pbar:
+            # print('step_idx:', step_idx)
             while not done:
                 B = 1
                 x_img = np.stack([x['image'] for x in obs_deque])
@@ -242,12 +198,11 @@ for epoch in range(n_test):
                 # only take action_horizon number of actions
                 start = obs_horizon - 1
                 end = start + action_horizon
-                action = action_pred[start:end, :]
 
                 # execute action_horizon number of steps
-                for j in range(len(action)):
+                for action in action_pred[start:end, :]:
                     # stepping env
-                    obs, reward, done, _, info = env.step(action[j])
+                    obs, reward, done, _, info = env.step(action)
                     # save observations
                     obs_deque.append(obs)
                     # and reward/vis
@@ -262,7 +217,85 @@ for epoch in range(n_test):
                     pbar.update(1)
                     pbar.set_postfix(reward=reward)
 
-                    if step_idx > max_steps:
+                    if step_idx > args.max_steps:
                         done = True
+                        print(f'trial {trail_ix} fail')
+                        break 
                     if done:
+                        print(f'trial {trail_ix} succeed')
+                        n_success += 1
                         break
+    
+    print(colored(f'eval summary epoch #{epoch}: {n_success / args.n_test}', 'green'))
+
+
+########################################################################
+#### Train the model
+for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
+    total_loss_train = 0.0
+    
+    nets.train()
+    
+    if args.frozen_vision:
+        nets['vision_encoder'].eval()
+    
+    for batch in dataloader:
+        x_img = batch['image'][:, :obs_horizon].to(device)
+        x_pos = batch['agent_pos'][:, :obs_horizon].to(device)
+        x_traj = batch['action'].to(device)
+
+        # print('x_img:', x_img.shape) # torch.Size([64, 1, 3, 96, 96])
+        # print('x_pos:', x_pos.shape)# torch.Size([64, 1, 2])
+        # print('x_traj:', x_traj.shape) # torch.Size([64, 16, 2]) 
+
+        x_traj = x_traj.float()
+        x0 = torch.randn(x_traj.shape, device=device)
+        timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
+
+        # encoder vision features
+        if args.frozen_vision:
+            with torch.no_grad():
+                image_features = nets['vision_encoder'](x_img.flatten(end_dim=1))
+        else:
+            image_features = nets['vision_encoder'](x_img.flatten(end_dim=1))
+
+
+        image_features = image_features.reshape(*x_img.shape[:2], -1)
+        obs_features = torch.cat([image_features, x_pos], dim=-1)
+        # obs_cond = obs_features.flatten(start_dim=1)
+        obs_cond = obs_features
+
+        vt = nets['noise_pred_net'](xt, timestep, obs_cond)
+
+        loss = torch.mean((vt - ut) ** 2)
+        total_loss_train += loss.detach()
+
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        lr_scheduler.step()
+
+        # update Exponential Moving Average of the model weights
+        # ema.step(nets.parameters())
+        ema.step(ema_params)
+
+    if epoch % args.eval_interval == 0 and epoch > 0:
+        avg_loss_train = total_loss_train / len(dataloader)
+        print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
+
+        # os.makedirs("./checkpoints/pusht", exist_ok=True)
+        ema.store(ema_params) 
+        ema.copy_to(ema_params)
+        # PATH = f'./checkpoints/pusht/cp-{epoch}.pth'
+        
+        torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
+                    'noise_pred_net': nets['noise_pred_net'].state_dict(),
+                    'epoch': epoch,
+                    'ema': ema.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict()}, 
+                    PATH_TMP)
+        ema.restore(ema_params)
+        
+        evaluation_rollouts(epoch, nets)
+   

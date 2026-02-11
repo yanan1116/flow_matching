@@ -158,7 +158,7 @@ for epoch in range(num_epochs):
         torch.save({
             'noise_pred_net': noise_pred_net.state_dict(),
         }, PATH)
-         ema.restore(noise_pred_net.parameters())
+        ema.restore(noise_pred_net.parameters())
 
 sys.exit(0)
 
@@ -201,7 +201,7 @@ for epoch in range(n_test):
 
                     timehorion = 16
                     for i in range(timehorion):
-                        noise = torch.rand(1, pred_horizon, action_dim).to(device)
+                        noise = torch.rand(1, pred_horizon, action_dim).to(device) # torch.randn
                         x0 = noise.expand(x_img.shape[0], -1, -1)
                         timestep = torch.tensor([i / timehorion]).to(device)
 
