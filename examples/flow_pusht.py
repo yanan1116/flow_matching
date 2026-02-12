@@ -33,7 +33,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
         "--net",
         type=str,
-        required=True,
+        #required=True,
         choices=['TransformerForDiffusion', 'ConditionalUnet1D']
     )
 
@@ -44,6 +44,11 @@ parser.add_argument(
 
 parser.add_argument(
         "--frozen_vision",
+        action='store_true',
+    )
+
+parser.add_argument(
+        "--debug",
         action='store_true',
     )
 
@@ -66,13 +71,40 @@ parser.add_argument(
 ) 
 
 parser.add_argument(
+    "--batchsize",
+    type=int,
+    default=64,
+) 
+
+parser.add_argument(
     "--eval_interval",
     type=int,
     default=100,
 ) 
+parser.add_argument(
+    "--obs_horizon",
+    type=int,
+    default=1,
+) 
+
+parser.add_argument(
+    "--action_horizon",
+    type=int,
+    default=8,
+) 
+
+parser.add_argument(
+    "--pred_horizon",
+    type=int,
+    default=16,
+) 
 
 args = parser.parse_args() 
     
+if args.eval_official:
+    args.net = 'ConditionalUnet1D'
+print('args:', args)
+ 
     
 ##################################
 dataset_path = "./dataset/pusht/pusht_cchi_v7_replay.zarr"
@@ -80,18 +112,15 @@ os.makedirs('./checkpoints/pusht', exist_ok=True)
 # PATH_TMP = f'./checkpoints/pusht/cp-tmp-{args.net}-{args.frozen_vision}.pth'
 PATH_OFFICIAL_CP = './checkpoints/pusht/flow_pusht.pth'
 
-obs_horizon = 1
-pred_horizon = 16
 action_dim = 2
-action_horizon = 8
 vision_feature_dim = 514
 
 # create dataset from file
 dataset = pusht.PushTImageDataset(
     dataset_path=dataset_path,
-    pred_horizon=pred_horizon,
-    obs_horizon=obs_horizon,
-    action_horizon=action_horizon
+    pred_horizon=args.pred_horizon,
+    obs_horizon=args.obs_horizon,
+    action_horizon=args.action_horizon
 )
 
 # save training data statistics (min, max) for each dim
@@ -100,7 +129,7 @@ stats = dataset.stats
 # create dataloader
 dataloader = DataLoader(
     dataset,
-    batch_size=64,
+    batch_size=args.batchsize,
     num_workers=16,
     shuffle=True,
     # accelerate cpu-gpu transfer
@@ -112,6 +141,30 @@ dataloader = DataLoader(
 
 print("Num samples:", len(dataset))
 print("Num batches:", len(dataloader))
+
+
+# within batch: agent_pos torch.Size([64, 1, 2]) 
+# within batch: action torch.Size([64, 16, 2])
+# within batch: image torch.Size([64, 1, 3, 96, 96]) 
+
+# dataset sanity check
+for ii, batch in enumerate(dataloader):
+    if ii == 0:
+        print(batch.keys())
+    x_img = batch['image'][:, :args.obs_horizon].to(device)
+    x_pos = batch['agent_pos'][:, :args.obs_horizon].to(device)
+    x_traj = batch['action'].to(device)
+
+    assert batch['image'].min() >= 0 and batch['image'].max() <= 255
+    assert batch['action'].min() >= -1 and batch['action'].max() <= 1
+    assert batch['agent_pos'].min() >= -1 and batch['agent_pos'].max() <= 1
+    
+    # if ii <=20 :
+    #     for k, v in batch.items():
+    #         print('within batch:', k, v.shape, v.min(), v.mean(), v.max())
+    #     print()
+# os._exit(0)
+
 
 # batch = next(iter(dataloader))
 # print(batch['image'].shape)
@@ -140,7 +193,7 @@ if args.net == 'TransformerForDiffusion':
     noise_pred_net = TransformerForDiffusion(
         input_dim=action_dim,
         output_dim=action_dim,
-        horizon=pred_horizon,
+        horizon=args.pred_horizon,
         cond_dim=vision_feature_dim
     )
 elif args.net == 'ConditionalUnet1D':
@@ -178,14 +231,11 @@ lr_scheduler = get_scheduler(
 
 FM = ConditionalFlowMatcher(sigma=sigma)
 
-if args.eval_official:
-    assert args.net == 'ConditionalUnet1D'
-    evaluation_rollouts(0, nets, PATH_OFFICIAL_CP)
-    os._exit(0)
-    
+            
+            
 ########################################################################
 #### Train the model
-for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
+for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="Training Epochs"):
     total_loss_train = 0.0
     
     nets.train()
@@ -194,16 +244,11 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
         nets['vision_encoder'].eval()
     
     for ii, batch in enumerate(dataloader):
-        x_img = batch['image'][:, :obs_horizon].to(device)
-        x_pos = batch['agent_pos'][:, :obs_horizon].to(device)
+        x_img = batch['image'][:, :args.obs_horizon].to(device)
+        x_pos = batch['agent_pos'][:, :args.obs_horizon].to(device)
         x_traj = batch['action'].to(device)
 
-        if ii == 0 :
-            print(batch.keys())
-            print('x_img:', x_img.shape) # torch.Size([64, 1, 3, 96, 96])
-            print('x_pos:', x_pos.shape)# torch.Size([64, 1, 2])
-            print('x_traj:', x_traj.shape) # torch.Size([64, 16, 2]) 
-
+   
         x_traj = x_traj.float()
         x0 = torch.randn(x_traj.shape, device=device)
         timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
@@ -236,8 +281,13 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
         # update Exponential Moving Average of the model weights
         # ema.step(nets.parameters())
         ema.step(ema_params)
+        
+        if (args.debug and ii >= 10) or args.eval_official:
+            break
+            
 
-    if epoch % args.eval_interval == 0 and epoch > 0:
+    if (epoch % args.eval_interval == 0 and epoch > 0) or args.eval_official :
+        nets.eval()
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
 
@@ -254,12 +304,13 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
         #             'lr_scheduler': lr_scheduler.state_dict()}, 
         #             PATH_TMP)
         # ema.restore(ema_params)
-    
-        # state_dict = torch.load(local_checkpoint_path, map_location='cuda')
+
+        if args.eval_official:
+            state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
+            nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
+            nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+            print('load official checkpoint success')
         # ema_nets = nets
-        # ema_nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-        # ema_nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
-        # print('load success')
         
         env = pusht.PushTImageEnv()
         n_success = 0
@@ -267,13 +318,12 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
         
         for trail_ix in range(args.n_test):
             print(f'do eval at trail:{trail_ix}')
-            # seed = random.randint(1, 10000)
-            seed = 1000 + trail_ix
+            seed = random.randint(1, 10000)
             env.seed(seed)
 
             obs, info = env.reset()
             obs_deque = collections.deque(
-                [obs] * obs_horizon, maxlen=obs_horizon)
+                [obs] * args.obs_horizon, maxlen = args.obs_horizon)
             imgs = [env.render(mode='rgb_array')]
             rewards = list()
             done = False
@@ -292,7 +342,7 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
                 # infer action
                 with torch.no_grad():
                     # get image features
-                    image_features = ema_nets['vision_encoder'](x_img)
+                    image_features = nets['vision_encoder'](x_img)
                     obs_features = torch.cat([image_features, x_pos], dim=-1)
                     
 
@@ -304,8 +354,8 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
                     timehorion = 16 
                     
                     for i in range(timehorion):
-                        noise = torch.rand(1, pred_horizon, action_dim).to(device)
-                        # noise = torch.randn(1, pred_horizon, action_dim).to(device)
+                        noise = torch.rand(1, args.pred_horizon, action_dim).to(device)
+                        # noise = torch.randn(1, args.pred_horizon, action_dim).to(device)
                         x0 = noise.expand(x_img.shape[0], -1, -1)
                         timestep = torch.tensor([i / timehorion]).to(device)
 
@@ -329,8 +379,8 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
                 action_pred = pusht.unnormalize_data(naction, stats=stats['action'])
 
                 # only take action_horizon number of actions
-                start = obs_horizon - 1
-                end = start + action_horizon
+                start = args.obs_horizon - 1
+                end = start + args.action_horizon
 
                 # execute action_horizon number of steps
                 for action in action_pred[start:end, :]:
@@ -366,3 +416,7 @@ for epoch in tqdm(range(args.num_epochs), desc="Training Epochs"):
             print() 
                     
         print(colored(f'final eval summary epoch #{epoch}:  reward:{np.array(final_rewards).mean()}  SR:{n_success / args.n_test}', 'green'))
+
+    
+    if args.eval_official:
+        os._exit(0)

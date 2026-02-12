@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import sys
+import sys,argparse
 sys.dont_write_bytecode = True
 # sys.path.append('../models')
 # sys.path.append('../kitchen')
@@ -43,12 +43,23 @@ device = 'cuda'
 dataset_path = "./dataset/kitchen"
 PATH_OFFICIAL_CP = './checkpoints/kitchen/flow_kitchen.pth'
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+        "--eval_official",
+        action='store_true',
+    )
+args = parser.parse_args() 
+
+print('args:', args)
+    
 obs_horizon = 1
 pred_horizon = 16
 action_dim = 9
 action_horizon = 8
 num_epochs = 10000
 vision_feature_dim = 60
+batch_size = 128
+eval_interval = 50
 
 # create dataset from file
 dataset = kitchen_lowdim_dataset.KitchenLowdimDataset(
@@ -60,7 +71,7 @@ dataset = kitchen_lowdim_dataset.KitchenLowdimDataset(
 # create dataloader
 dataloader = DataLoader(
     dataset,
-    batch_size=64,
+    batch_size=batch_size,
     num_workers=16,
     shuffle=True,
     # accelerate cpu-gpu transfer
@@ -72,6 +83,8 @@ dataloader = DataLoader(
 
 print("Num samples:", len(dataset))
 print("Num batches:", len(dataloader))
+
+
 
 ##################################################################
 # create network object
@@ -99,7 +112,8 @@ avg_loss_val_list = []
 ########################################################################
 #### Train the model
 
-for epoch in tqdm(range(num_epochs)):
+for epoch in tqdm(range(1 if args.eval_official else num_epochs)):
+    noise_pred_net.train()
     total_loss_train = 0.0
     batct_cnt = 0
     for ii, batch in enumerate(dataloader):
@@ -128,22 +142,26 @@ for epoch in tqdm(range(num_epochs)):
         # update Exponential Moving Average of the model weights
         ema.step(noise_pred_net.parameters())
         batct_cnt += 1
-        
-        # if batct_cnt >= 5:
-        #     break
-
-    avg_loss_train = total_loss_train / len(dataloader)
-    print(colored(f"epoch: {epoch:>02},  loss_train: {avg_loss_train:.10f}", 'yellow'))
-
-    if epoch > 0 and  epoch % 5 == 0:
         # ema.store(noise_pred_net.parameters()) 
         # ema.copy_to(noise_pred_net.parameters())
         # PATH = f'./checkpoints/kitchen/flow_kitchen_cp_{epoch}.pth'
         # torch.save({ 'noise_pred_net': noise_pred_net.state_dict(),}, PATH)
-        # ema.restore(noise_pred_net.parameters())
-        # state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
-        # noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+        # ema.restore(noise_pred_net.parameters())        
+        # if batct_cnt >= 5:
+        #     break
+        if args.eval_official:
+            break
+        
+    avg_loss_train = total_loss_train / len(dataloader)
+    print(colored(f"epoch: {epoch:>02},  loss_train: {avg_loss_train:.10f}", 'yellow'))
 
+    if (epoch > 0 and epoch % eval_interval == 0) or args.eval_official:
+        if args.eval_official:
+            state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
+            noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+
+        noise_pred_net.eval()
+        
         max_steps = 280
         env = KitchenAllV0(use_abs_action=False)
 
@@ -240,5 +258,9 @@ for epoch in tqdm(range(num_epochs)):
             final_rewards.append(reward) 
             assert len(final_rewards) == trail_ix + 1     
             print(f'trial eval summary at epoch {epoch} SR:{n_success / (trail_ix+1)}\n')
-        print(f'trial eval summary at epoch {epoch} SR:{n_success / (n_test)}\n')
-            
+        print(f'final eval summary at epoch {epoch} SR:{n_success / (n_test)}\n')
+        
+        if args.eval_official:
+            os._exit(0)
+
+         
