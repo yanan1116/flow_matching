@@ -303,68 +303,68 @@ else:
         step_idx = 0
         done = False
 
-        with tqdm(total=max_steps, desc="Eval Env") as pbar:
-            while not done:
-                x_img = np.stack([x for x in obs_deque])
-                x_img = torch.from_numpy(x_img)
-                x_img = normalizers['obs'].normalize(x_img)
-                x_img = x_img.to(device, dtype=torch.float32)
+        # with tqdm(total=max_steps, desc="Eval Env") as pbar:
+        while not done:
+            x_img = np.stack([x for x in obs_deque])
+            x_img = torch.from_numpy(x_img)
+            x_img = normalizers['obs'].normalize(x_img)
+            x_img = x_img.to(device, dtype=torch.float32)
 
-                # infer action
-                with torch.no_grad():
-                    # get image features
-                    obs_cond = x_img.flatten(start_dim=1)
+            # infer action
+            with torch.no_grad():
+                # get image features
+                obs_cond = x_img.flatten(start_dim=1)
 
-                    timehorion = 1
-                    for i in range(timehorion):
-                        noise = torch.rand(1, pred_horizon, action_dim).to(device)
-                        x0 = noise.expand(x_img.shape[0], -1, -1)
-                        timestep = torch.tensor([i / timehorion]).to(device)
+                timehorion = 1
+                for i in range(timehorion):
+                    noise = torch.rand(1, pred_horizon, action_dim).to(device)
+                    x0 = noise.expand(x_img.shape[0], -1, -1)
+                    timestep = torch.tensor([i / timehorion]).to(device)
 
-                        if i == 0:
-                            vt = noise_pred_net(x0, timestep, global_cond=obs_cond)
-                            traj = (vt * 1 / timehorion + x0)
+                    if i == 0:
+                        vt = noise_pred_net(x0, timestep, global_cond=obs_cond)
+                        traj = (vt * 1 / timehorion + x0)
 
-                        else:
-                            vt = noise_pred_net(traj, timestep, global_cond=obs_cond)
-                            traj = (vt * 1 / timehorion + traj)
+                    else:
+                        vt = noise_pred_net(traj, timestep, global_cond=obs_cond)
+                        traj = (vt * 1 / timehorion + traj)
 
-                    naction = traj.detach().to('cpu').numpy()
-                    naction = naction[0]
-                    action_pred = normalizers['action'].unnormalize(naction)
+                naction = traj.detach().to('cpu').numpy()
+                naction = naction[0]
+                action_pred = normalizers['action'].unnormalize(naction)
 
-                    # only take action_horizon number of actions
-                    start = obs_horizon - 1
-                    end = start + action_horizon
-                    action = action_pred[start:end, :]
+                # only take action_horizon number of actions
+                start = obs_horizon - 1
+                end = start + action_horizon
+                action = action_pred[start:end, :]
 
-                    for j in range(len(action)):
-                        # stepping env
-                        env_action = undo_transform_action(action[j])
-                        obs, reward, done, info = wrapper.step(env_action)
-                        # save observations
-                        obs_deque.append(obs)
-                        # and reward/vis
-                        rewards.append(reward)
+                for j in range(len(action)):
+                    # stepping env
+                    env_action = undo_transform_action(action[j])
+                    obs, reward, done, info = wrapper.step(env_action)
+                    # save observations
+                    obs_deque.append(obs)
+                    # and reward/vis
+                    rewards.append(reward)
 
-                        imgs.append(wrapper.render(mode='rgb_array'))
+                    imgs.append(wrapper.render(mode='rgb_array'))
 
-                        # update progress bar
-                        step_idx += 1
+                    # update progress bar
+                    step_idx += 1
 
-                        pbar.update(1)
-                        pbar.set_postfix(reward=reward)
+                    # pbar.update(1)
+                    # pbar.set_postfix(reward=reward)
 
-                        if step_idx > max_steps :
-                            print(f'trial {trail_ix} fail')
-                            done = True
-                            break
-                        
-                        if done or reward == 1:
-                            n_success += 1
-                            print(f'trial {trail_ix} succeed')
-                            done = True
-                            break
+                    if step_idx > max_steps :
+                        print(f'trial {trail_ix} fail')
+                        done = True
+                        break
+                    
+                    if done or reward == 1:
+                        n_success += 1
+                        print(f'trial {trail_ix} succeed')
+                        done = True
+                        break
 
                    
                             

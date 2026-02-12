@@ -1,42 +1,13 @@
 #!/usr/bin/env python
-#
-# Copyright (c) 2024, Honda Research Institute Europe GmbH
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
-#
-# 1. Redistributions of source code must retain the above copyright notice,
-#  this list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright
-#  notice, this list of conditions and the following disclaimer in the
-#  documentation and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#  contributors may be used to endorse or promote products derived from
-#  this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
-# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
-# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# This notebook is an example of "Affordance-based Robot Manipulation with Flow Matching" https://arxiv.org/abs/2409.01083
-
 import sys
-
 sys.dont_write_bytecode = True
-sys.path.append('../models')
-sys.path.append('../kitchen')
-import os
+# sys.path.append('../models')
+# sys.path.append('../kitchen')
+sys.path.append('./external/models')
+sys.path.append('./external')
+import os,random
+# os.environ["MUJOCO_GL"] = "egl"
+from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -64,18 +35,19 @@ from torchcfm.models.models import *
 import kitchen_lowdim_dataset
 from diffusion_policy.env.kitchen.v0 import KitchenAllV0
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 #dtype = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-
+device = 'cuda'
 ##################################
 ###### add Franka kitchen data to some folder
-dataset_path = "./kitchen/data"
+dataset_path = "./dataset/kitchen"
+PATH_OFFICIAL_CP = './checkpoints/kitchen/flow_kitchen.pth'
 
 obs_horizon = 1
 pred_horizon = 16
 action_dim = 9
 action_horizon = 8
-num_epochs = 4501
+num_epochs = 10000
 vision_feature_dim = 60
 
 # create dataset from file
@@ -83,19 +55,23 @@ dataset = kitchen_lowdim_dataset.KitchenLowdimDataset(
     dataset_dir=dataset_path,
     horizon=16,
 )
-print(len(dataset))
+
 
 # create dataloader
 dataloader = DataLoader(
     dataset,
     batch_size=64,
-    num_workers=4,
+    num_workers=16,
     shuffle=True,
     # accelerate cpu-gpu transfer
     pin_memory=True,
     # don't kill worker process afte each epoch
     persistent_workers=True
 )
+# batch = next(iter(dataloader))
+
+print("Num samples:", len(dataset))
+print("Num batches:", len(dataloader))
 
 ##################################################################
 # create network object
@@ -118,17 +94,21 @@ lr_scheduler = get_scheduler(
 )
 
 FM = ConditionalFlowMatcher(sigma=sigma)
-avg_loss_train_list = []
 avg_loss_val_list = []
 
 ########################################################################
 #### Train the model
-for epoch in range(num_epochs):
-    total_loss_train = 0.0
-    for data in tqdm(dataloader):
-        x_img = data['obs'][:, :obs_horizon].to(device)
-        x_traj = data['action'].to(device)
 
+for epoch in tqdm(range(num_epochs)):
+    total_loss_train = 0.0
+    batct_cnt = 0
+    for ii, batch in enumerate(dataloader):
+        x_img = batch['obs'][:, :obs_horizon].to(device)
+        x_traj = batch['action'].to(device)
+        if ii == 0:
+            print(batch.keys())
+            print('obs:', batch['obs'].shape) # torch.Size([64, 16, 60])
+            print('action:', batch['action'].shape) # torch.Size([64, 16, 9])
         x_traj = x_traj.float()
         x0 = torch.randn(x_traj.shape, device=device)
         timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
@@ -147,49 +127,45 @@ for epoch in range(num_epochs):
 
         # update Exponential Moving Average of the model weights
         ema.step(noise_pred_net.parameters())
+        batct_cnt += 1
+        
+        # if batct_cnt >= 5:
+        #     break
 
     avg_loss_train = total_loss_train / len(dataloader)
-    avg_loss_train_list.append(avg_loss_train.detach().cpu().numpy())
     print(colored(f"epoch: {epoch:>02},  loss_train: {avg_loss_train:.10f}", 'yellow'))
 
-    if epoch == 4500:
-        ema.copy_to(noise_pred_net.parameters())
-        PATH = './checkpoint_k/flow_ema_%05d.pth' % epoch
-        torch.save({
-            'noise_pred_net': noise_pred_net.state_dict(),
-        }, PATH)
-        ema.restore(noise_pred_net.parameters())
+    if epoch > 0 and  epoch % 5 == 0:
+        # ema.store(noise_pred_net.parameters()) 
+        # ema.copy_to(noise_pred_net.parameters())
+        # PATH = f'./checkpoints/kitchen/flow_kitchen_cp_{epoch}.pth'
+        # torch.save({ 'noise_pred_net': noise_pred_net.state_dict(),}, PATH)
+        # ema.restore(noise_pred_net.parameters())
+        # state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
+        # noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
 
-sys.exit(0)
+        max_steps = 280
+        env = KitchenAllV0(use_abs_action=False)
 
-##################################################################
-###### test the model
-PATH = './flow_ema_04500.pth'
-state_dict = torch.load(PATH, map_location='cuda')
-noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+        n_test = 100
 
-max_steps = 280
-env = KitchenAllV0(use_abs_action=False)
+        n_success = 0
+        final_rewards = []
+            
+        ###### please choose the seed you want to test
+        for trail_ix in range(n_test):
+            seed = random.randint(1, 10000)
+            env.seed(seed)
+            obs = env.reset()
 
-test_start_seed = 10000
-n_test = 500
+            obs_deque = collections.deque(
+                [obs] * obs_horizon, maxlen=obs_horizon)
+            imgs = [env.render(mode='rgb_array')]
+            rewards = list()
+            done = False
+            step_idx = 0
 
-###### please choose the seed you want to test
-for epoch in range(n_test):
-    seed = test_start_seed + epoch
-    env.seed(seed)
-
-    for pp in range(10):
-        obs = env.reset()
-
-        obs_deque = collections.deque(
-            [obs] * obs_horizon, maxlen=obs_horizon)
-        imgs = [env.render(mode='rgb_array')]
-        rewards = list()
-        done = False
-        step_idx = 0
-
-        with tqdm(total=max_steps, desc="Eval KitchenAllV0") as pbar:
+            # with tqdm(total=max_steps, desc="Eval KitchenAllV0") as pbar:
             while not done:
                 x_img = np.stack([x for x in obs_deque])
                 x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
@@ -224,20 +200,45 @@ for epoch in range(n_test):
 
                     for j in range(len(action)):
                         # stepping env
-                        obs, reward, done, info = env.step(action[j])
+                        out_step = env.step(action[j])
+                        assert len(out_step) == 4
+                        obs, reward, done, info = out_step
+                        # print(f'action step {step_idx} / {max_steps} --->', info['completed_tasks'], reward)
                         # save observations
                         obs_deque.append(obs)
                         # and reward/vis
                         rewards.append(reward)
-                        imgs.append(env.render(mode='rgb_array'))
-
+                        img = env.render(mode='rgb_array')
+                        imgs.append(img)
+                        # Image.fromarray(img).save(f"saved_images/franka_kitchen_{step_idx:06d}.png")
                         # update progress bar
                         step_idx += 1
 
-                        pbar.update(1)
-                        pbar.set_postfix(reward=reward)
+                        # pbar.update(1)
+                        # pbar.set_postfix(reward=reward)
+                        assert reward in [0, 1]
+                        tasks_n_completed = len(info['completed_tasks'])
+                        # if tasks_n_completed == 4:
+                        #     assert reward == 1 
+                        # else:
+                        #     assert reward == 0, f'reward error: {reward} {tasks_n_completed}'
+                            
 
-                        if step_idx > max_steps or sum(rewards) == 4:
+                        if len(info['completed_tasks'])>=4:
+                            print(f'trial {trail_ix} succeed')
+                            n_success += 1
                             done = True
-                        if done:
-                            break
+                            break 
+
+                        if step_idx > max_steps: 
+                            done = True
+                            print(f'trial {trail_ix} fail')
+                            break                
+
+            # tasks_complted = len(info['completed_tasks'])
+            # print(f'trial reward: {reward} completed tasks: {tasks_complted}')
+            final_rewards.append(reward) 
+            assert len(final_rewards) == trail_ix + 1     
+            print(f'trial eval summary at epoch {epoch} SR:{n_success / (trail_ix+1)}\n')
+        print(f'trial eval summary at epoch {epoch} SR:{n_success / (n_test)}\n')
+            
