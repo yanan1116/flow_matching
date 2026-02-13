@@ -30,75 +30,19 @@ assert torch.cuda.is_available()
 device = 'cuda'
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-        "--net",
-        type=str,
-        #required=True,
-        choices=['TransformerForDiffusion', 'ConditionalUnet1D']
-    )
-
-parser.add_argument(
-        "--eval_official",
-        action='store_true',
-    )
-
-parser.add_argument(
-        "--frozen_vision",
-        action='store_true',
-    )
-
-parser.add_argument(
-        "--debug",
-        action='store_true',
-    )
-
-parser.add_argument(
-    "--max_steps",
-    type=int,
-    default=300,
-)
-
-parser.add_argument(
-    "--n_test",
-    type=int,
-    default=100,
-) 
-
-parser.add_argument(
-    "--num_epochs",
-    type=int,
-    default=10000,
-) 
-
-parser.add_argument(
-    "--batchsize",
-    type=int,
-    default=64,
-) 
-
-parser.add_argument(
-    "--eval_interval",
-    type=int,
-    default=100,
-) 
-parser.add_argument(
-    "--obs_horizon",
-    type=int,
-    default=1,
-) 
-
-parser.add_argument(
-    "--action_horizon",
-    type=int,
-    default=8,
-) 
-
-parser.add_argument(
-    "--pred_horizon",
-    type=int,
-    default=16,
-) 
-
+parser.add_argument( "--eval_official", action='store_true')
+parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
+parser.add_argument("--frozen_vision", action="store_true")
+parser.add_argument("--debug", action="store_true")
+parser.add_argument("--normalize_images_01", action="store_true")
+parser.add_argument("--max_steps", type=int, default=300)
+parser.add_argument("--n_test", type=int, default=100)
+parser.add_argument("--num_epochs", type=int, default=5000)
+parser.add_argument("--batchsize", type=int, default=64)
+parser.add_argument("--eval_interval", type=int, default=100)
+parser.add_argument("--obs_horizon", type=int, default=1)
+parser.add_argument("--action_horizon", type=int, default=8)
+parser.add_argument("--pred_horizon", type=int, default=16)
 args = parser.parse_args() 
     
 if args.eval_official:
@@ -107,7 +51,7 @@ print('args:', args)
  
     
 ##################################
-dataset_path = "./dataset/pusht/pusht_cchi_v7_replay.zarr"
+
 os.makedirs('./checkpoints/pusht', exist_ok=True)
 # PATH_TMP = f'./checkpoints/pusht/cp-tmp-{args.net}-{args.frozen_vision}.pth'
 PATH_OFFICIAL_CP = './checkpoints/pusht/flow_pusht.pth'
@@ -117,7 +61,7 @@ vision_feature_dim = 514
 
 # create dataset from file
 dataset = pusht.PushTImageDataset(
-    dataset_path=dataset_path,
+    dataset_path="./dataset/pusht/pusht_cchi_v7_replay.zarr",
     pred_horizon=args.pred_horizon,
     obs_horizon=args.obs_horizon,
     action_horizon=args.action_horizon
@@ -141,30 +85,6 @@ dataloader = DataLoader(
 
 print("Num samples:", len(dataset))
 print("Num batches:", len(dataloader))
-
-
-# within batch: agent_pos torch.Size([64, 1, 2]) 
-# within batch: action torch.Size([64, 16, 2])
-# within batch: image torch.Size([64, 1, 3, 96, 96]) 
-
-# dataset sanity check
-for ii, batch in enumerate(dataloader):
-    if ii == 0:
-        print(batch.keys())
-    x_img = batch['image'][:, :args.obs_horizon].to(device)
-    x_pos = batch['agent_pos'][:, :args.obs_horizon].to(device)
-    x_traj = batch['action'].to(device)
-
-    assert batch['image'].min() >= 0 and batch['image'].max() <= 255
-    assert batch['action'].min() >= -1 and batch['action'].max() <= 1
-    assert batch['agent_pos'].min() >= -1 and batch['agent_pos'].max() <= 1
-    
-    # if ii <=20 :
-    #     for k, v in batch.items():
-    #         print('within batch:', k, v.shape, v.min(), v.mean(), v.max())
-    #     print()
-# os._exit(0)
-
 
 # batch = next(iter(dataloader))
 # print(batch['image'].shape)
@@ -242,14 +162,23 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
     
     if args.frozen_vision:
         nets['vision_encoder'].eval()
+
     
     for ii, batch in enumerate(dataloader):
-        x_img = batch['image'][:, :args.obs_horizon].to(device)
-        x_pos = batch['agent_pos'][:, :args.obs_horizon].to(device)
-        x_traj = batch['action'].to(device)
+        if ii == 0 and epoch == 0:
+            print('batch keys:',  batch.keys())
+            
+        x_img = batch['image'][:, :args.obs_horizon].to(device).float()
+        x_pos = batch['agent_pos'][:, :args.obs_horizon].to(device).float()
+        x_traj = batch['action'].to(device).float()
 
-   
-        x_traj = x_traj.float()
+        assert batch['image'].min() >= 0 and batch['image'].max() <= 255 and batch['image'].max() > 1
+        assert batch['action'].min() >= -1 and batch['action'].max() <= 1
+        assert batch['agent_pos'].min() >= -1 and batch['agent_pos'].max() <= 1
+    
+        if args.normalize_images_01:
+            x_img = x_img / 255.0
+            
         x0 = torch.randn(x_traj.shape, device=device)
         timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
 
@@ -310,7 +239,6 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
             nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
             print('load official checkpoint success')
-        # ema_nets = nets
         
         env = pusht.PushTImageEnv()
         n_success = 0
@@ -337,6 +265,11 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
                 x_pos = np.stack([x['agent_pos'] for x in obs_deque])
                 x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
 
+                assert x_img.min() >= 0 and x_img.max() <= 1 , 'assertion error at obs_deque within loop'
+                
+                # if args.normalize_images_01:
+                #     x_img = x_img / 255.0
+            
                 x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
                 x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
                 # infer action

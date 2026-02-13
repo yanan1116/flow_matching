@@ -66,8 +66,6 @@ dataset = kitchen_lowdim_dataset.KitchenLowdimDataset(
     dataset_dir=dataset_path,
     horizon=16,
 )
-
-
 # create dataloader
 dataloader = DataLoader(
     dataset,
@@ -170,7 +168,6 @@ for epoch in tqdm(range(1 if args.eval_official else num_epochs)):
         n_success = 0
         final_rewards = []
             
-        ###### please choose the seed you want to test
         for trail_ix in range(n_test):
             seed = random.randint(1, 10000)
             env.seed(seed)
