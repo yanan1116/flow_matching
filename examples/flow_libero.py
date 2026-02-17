@@ -28,6 +28,66 @@ from unet import ConditionalUnet1D
 from utils import *
 from datasets import load_dataset
 
+from libero.libero import benchmark
+import pathlib,math,random,imageio,collections,os,sys
+from libero.libero import get_libero_path
+print('bddl files path:', get_libero_path("bddl_files"))
+
+from libero.libero.envs import OffScreenRenderEnv
+import numpy as np
+
+benchmark_dict = benchmark.get_benchmark_dict()
+LIBERO_ENV_RESOLUTION = 256
+LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+num_steps_wait = 10
+video_out_path: str = "./saved_videos"
+
+
+def _get_libero_env(task, resolution, seed):
+    """Initializes and returns the LIBERO environment, along with the task description."""
+    task_description = task.language
+    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    # env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    print('task_bddl_file:', task_bddl_file)
+    # change for libero-plus
+    env_args = {
+        "bddl_file_name": str(task_bddl_file),  # 或 task_bddl_file.as_posix()
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+    }
+
+    env = OffScreenRenderEnv(**env_args)
+    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    return env, task_description
+
+
+def _quat2axisangle(quat):
+    """
+    Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
+    """
+    # clip quaternion
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        # This is (close to) a zero degree rotation, immediately return
+        return np.zeros(3)
+
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+def get_state(obs):
+    state = np.concatenate(
+                    (
+                        obs["robot0_eef_pos"],
+                        _quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    ))
+    assert state.shape == (8,) 
+    return state
+
 assert torch.cuda.is_available()
 device = 'cuda'
 parser = argparse.ArgumentParser()
@@ -153,13 +213,29 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         
         batch_state_min = batch['state'].min()
         batch_state_max = batch['state'].max()
-        assert batch['state'].min() >= -3.14*2 and batch['state'].max() <= 3.14*2, f'state range error: {batch_state_min} {batch_state_max}'
+        assert batch['state'].min() >= -3.14*2 and batch['state'].max() <= 3.14*2 and batch['state'].min() < -1 and batch['state'].max() > 1, \
+                f'state range error: {batch_state_min} {batch_state_max}'
 
         x_main_img = batch['image'].to(device, non_blocking=True).float()
         x_wrist_image = batch['wrist_image'].to(device, non_blocking=True).float()
         x_pos = batch['state'].to(device, non_blocking=True).float()
         x_traj = batch['actions'].to(device, non_blocking=True).float()
-
+        
+        print('train x_main_img:', x_main_img.shape)
+        print('train x_wrist_image:', x_wrist_image.shape)
+        print('train x_pos:', x_pos.shape)
+        
+        # (batch_size, obs_horizon, channel, height, width)
+        # train x_main_img: torch.Size([64, 1, 3, 256, 256])                                                                                                 | 16/3850 [00:04<09:47,  6.53it/s, loss=1.2]
+        # train x_wrist_image: torch.Size([64, 1, 3, 256, 256])
+        # train x_pos: torch.Size([64, 1, 8])
+        # train image_main_features: torch.Size([64, 512])
+        # train image_wrist_features: torch.Size([64, 512])
+        # train main_feat: torch.Size([64, 1, 512])
+        # train wrist_feat: torch.Size([64, 1, 512])
+        # train x_pos_rep: torch.Size([64, 1, 8])
+        # train obs_features: torch.Size([64, 1, 1032])
+                
         x0 = torch.randn(x_traj.shape, device=device)
         timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
 
@@ -173,17 +249,26 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             image_wrist_features = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1))
 
         # print(x_main_img.shape, x_main_img.flatten(end_dim=1).shape, image_main_features.shape)
+        print('train image_main_features:', image_main_features.shape)
+        print('train image_wrist_features:', image_wrist_features.shape)
+        
         
         main_feat  = image_main_features.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
         wrist_feat = image_wrist_features.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]
+        
+        print('train main_feat:', main_feat.shape)
+        print('train wrist_feat:', wrist_feat.shape)        
         
         if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
             x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
         else:
             x_pos_rep = x_pos  # 已经是 [B,O,8] 或 O=1
-            
+        
+        print('train x_pos_rep:', x_pos_rep.shape) 
+         
         obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
         # print('obs_features:', obs_features.shape)
+        print('train obs_features:', obs_features.shape) 
         
         # 期望的 per-timestep cond 维度
         expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1]
@@ -222,141 +307,247 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # ema.step(nets.parameters())
         ema.step(ema_params)
         
-        if args.debug and ii >= 100:
+        if args.debug and ii >= 16:
             break
     
     
     
     
-    
-    if epoch % args.eval_interval == 0 and epoch > 0 :
+    # do evaluation below
+    if (epoch % args.eval_interval == 0 and epoch > 0) or args.debug :
 
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
 
-        os.makedirs("./checkpoints/libero", exist_ok=True)
-        ema.store(ema_params) 
-        ema.copy_to(ema_params)
+        # os.makedirs("./checkpoints/libero", exist_ok=True)
+        # ema.store(ema_params) 
+        # ema.copy_to(ema_params)
         
-        torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
-                    'noise_pred_net': nets['noise_pred_net'].state_dict(),
-                    'epoch': epoch,
-                    'ema': ema.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    "args": vars(args)}, 
-                    f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
-        ema.restore(ema_params)
-
-        #  nets.eval()
-        #     state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
-        #     nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-        #     nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
-        #     print('load official checkpoint success')
+        # torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
+        #             'noise_pred_net': nets['noise_pred_net'].state_dict(),
+        #             'epoch': epoch,
+        #             'ema': ema.state_dict(),
+        #             'optimizer': optimizer.state_dict(),
+        #             'lr_scheduler': lr_scheduler.state_dict(),
+        #             "args": vars(args)}, 
+        #             f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
+        # ema.restore(ema_params)
+        PATH_OFFICIAL_CP = './checkpoints/libero/cp-ConditionalUnet1D-300.pth'
+        nets.eval()
+        state_dict = torch.load(PATH_OFFICIAL_CP, map_location='cuda')
+        nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
+        nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+        print('load official checkpoint success')
         
-        # env = pusht.PushTImageEnv()
-        # n_success = 0
-        # final_rewards = []
-        
-        # for trail_ix in range(args.n_test):
-        #     print(f'do eval at trail:{trail_ix}')
-        #     seed = random.randint(1, 10000)
-        #     env.seed(seed)
 
-        #     obs, info = env.reset()
-        #     obs_deque = collections.deque(
-        #         [obs] * args.obs_horizon, maxlen = args.obs_horizon)
-        #     imgs = [env.render(mode='rgb_array')]
-        #     rewards = list()
-        #     done = False
-        #     step_idx = 0
+        for task_suite_name in benchmark_dict.keys():
 
-        #     # with tqdm(total=args.max_steps, disable=True, desc="Eval PushTImageEnv") as pbar:
-        #     # print('step_idx:', step_idx)
-        #     while not done:
-        #         B = 1
-        #         x_img = np.stack([x['image'] for x in obs_deque])
-        #         x_pos = np.stack([x['agent_pos'] for x in obs_deque])
-        #         x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
+            if task_suite_name in ['libero_90', 'libero_100']:
+                continue   
+            
+            seed = random.randint(1, 10000)
+            np.random.seed(seed)
+            task_suite = benchmark_dict[task_suite_name]()
 
-        #         x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
-        #         x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
-        #         # infer action
-        #         with torch.no_grad():
-        #             # get image features
-        #             image_features = nets['vision_encoder'](x_img)
-        #             obs_features = torch.cat([image_features, x_pos], dim=-1)
+            print(task_suite_name, task_suite.n_tasks)
+
+            if task_suite_name == "libero_spatial":
+                max_steps = 220  # longest training demo has 193 steps
+            elif task_suite_name == "libero_object":
+                max_steps = 280  # longest training demo has 254 steps
+            elif task_suite_name == "libero_goal":
+                max_steps = 300  # longest training demo has 270 steps
+            elif task_suite_name == "libero_10":
+                max_steps = 520  # longest training demo has 505 steps
+            elif task_suite_name == "libero_90":
+                max_steps = 400  # longest training demo has 373 steps
+            else:
+                raise ValueError(f"Unknown task suite: {task_suite_name}")
+            
+            # for task_id in tqdm.tqdm(range(task_suite.n_tasks)):
+            #     # Get task in suite
+            #     task = task_suite.get_task(task_id)
+                
+                
+            #     task_description = task.language
+                
+            #     print(task_id, '===>', task)
+            #     print('task_description===>', task_description)
+            task_ll = list(range(task_suite.n_tasks))
+            random.shuffle(task_ll)
+            for task_id in tqdm(task_ll):
+
+                task = task_suite.get_task(task_id)
+
+                # Get default LIBERO initial states
+                initial_states = task_suite.get_task_init_states(task_id)
+                if len(initial_states) != 50:
+                    print(task_id , 'initial_states length:', len(initial_states))
+                    continue
+                # Initialize LIBERO environment and task description
+                env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
+
+                # Start episodes
+                task_episodes, task_successes = 0, 0
+                print('task_id:{} task_description:{}'.format(task_id, task_description))
+                # for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+                for episode_idx in range(10):
+
+                    # Reset environment
+                    env.reset()
+                    action_plan = collections.deque()
+
+                    # Set initial states
+                    obs = env.set_init_state(initial_states[episode_idx])
                     
+                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                    # and we need to wait for them to fall
+                    for _ in range( num_steps_wait):
+                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
 
-        #             if args.net == 'ConditionalUnet1D':
-        #                 obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)   
-        #             elif args.net == 'TransformerForDiffusion':
-        #                 obs_cond = obs_features.unsqueeze(0)
+                    print( 'obs:', obs.keys()) # odict_keys(['robot0_joint_pos', 'robot0_joint_pos_cos', 'robot0_joint_pos_sin', 'robot0_joint_vel', 'robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos', 'robot0_gripper_qvel', 'agentview_image', 'robot0_eye_in_hand_image', 'akita_black_bowl_1_pos', 'akita_black_bowl_1_quat', 'akita_black_bowl_1_to_robot0_eef_pos', 'akita_black_bowl_1_to_robot0_eef_quat', 'akita_black_bowl_2_pos', 'akita_black_bowl_2_quat', 'akita_black_bowl_2_to_robot0_eef_pos', 'akita_black_bowl_2_to_robot0_eef_quat', 'cookies_1_pos', 'cookies_1_quat', 'cookies_1_to_robot0_eef_pos', 'cookies_1_to_robot0_eef_quat', 'glazed_rim_porcelain_ramekin_1_pos', 'glazed_rim_porcelain_ramekin_1_quat', 'glazed_rim_porcelain_ramekin_1_to_robot0_eef_pos', 'glazed_rim_porcelain_ramekin_1_to_robot0_eef_quat', 'plate_1_pos', 'plate_1_quat', 'plate_1_to_robot0_eef_pos', 'plate_1_to_robot0_eef_quat', 'robot0_proprio-state', 'object-state'])
+                     
+                    assert obs["agentview_image"].shape == (256, 256, 3) and obs["robot0_eye_in_hand_image"].shape == (256, 256, 3) , 'inference images shape check'
+                    for img_ in [obs["agentview_image"], obs["robot0_eye_in_hand_image"]]:
+                        assert img_.min() >= 0 and img_.max() > 1 and img_.max() < 256
+
+                    
+                    obs_deque = collections.deque([obs] * args.obs_horizon, maxlen = args.obs_horizon)
+                    
+                    
+                    done = False
+                    # Setup
+                    t = 0
+                    replay_images = []
+
+                    # logging.info(f"Starting episode {task_episodes+1}...")
+                    print('trial:', task_episodes)
+                    while not done:
+
+                        for x in obs_deque:
+                            assert  x["agentview_image"].shape == (256, 256, 3)
                         
-        #             timehorion = 16 
+                        x_main_img = np.stack([
+                            np.ascontiguousarray(
+                                x["agentview_image"][::-1, ::-1, :].transpose(2, 0, 1)[None, ...]
+                            )
+                            for x in obs_deque
+                        ])
+
+                        x_wrist_image = np.stack([
+                                np.ascontiguousarray(
+                                    x["robot0_eye_in_hand_image"][::-1, ::-1, :].transpose(2, 0, 1)[None, ...]
+                                )
+                                for x in obs_deque
+                            ])                       
+
+                      
+                        x_pos = np.stack([get_state(x) for x in obs_deque])[None, ...]
+                      
+                        assert isinstance(x_main_img, np.ndarray) and isinstance(x_wrist_image, np.ndarray) and isinstance(x_pos, np.ndarray)
+                        print('infer x_main_img:', x_main_img.shape)
+                        print('infer x_wrist_image:', x_wrist_image.shape)
+                        print('infer x_pos:', x_pos.shape)
+                                               
+                        x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.float32)
+                        x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.float32)
+                        x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)        
+
+                        with torch.no_grad():
+                            
+                            image_main_features = nets['vision_encoder'](x_main_img.flatten(end_dim=1))
+                            image_wrist_features = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1))
+
+                            print('infer image_main_features:', image_main_features.shape)
+                            print('infer image_wrist_features:', image_wrist_features.shape)                             
+
+                            main_feat  = image_main_features.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
+                            wrist_feat = image_wrist_features.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]                        
+                                            
+                            print('infer main_feat:', main_feat.shape)
+                            print('infer wrist_feat:', wrist_feat.shape)  
+        
+                            if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
+                                x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
+                            else:
+                                x_pos_rep = x_pos  # 已经是 [B,O,8] 或 O=1                            
+
+                            print('infer x_pos_rep:', x_pos_rep.shape) 
+                            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
+                            print('infer obs_features:', obs_features.shape) 
+                        
+                        os._exit(0)
+                        # infer x_main_img: (1, 1, 3, 256, 256)
+                        # infer x_wrist_image: (1, 1, 3, 256, 256)
+                        # infer x_pos: (1, 1, 8)
+                        # infer image_main_features: torch.Size([1, 512])
+                        # infer image_wrist_features: torch.Size([1, 512])
+                        # infer main_feat: torch.Size([1, 1, 512])
+                        # infer wrist_feat: torch.Size([1, 1, 512])
+                        # infer x_pos_rep: torch.Size([1, 1, 8])
+                        # infer obs_features: torch.Size([1, 1, 1032])
+                        # Get preprocessed image
+                        # IMPORTANT: rotate 180 degrees to match train preprocessing
+
                     
-        #             for i in range(timehorion):
-        #                 noise = torch.rand(1, args.pred_horizon, action_dim).to(device)
-        #                 # noise = torch.randn(1, args.pred_horizon, action_dim).to(device)
-        #                 x0 = noise.expand(x_img.shape[0], -1, -1)
-        #                 timestep = torch.tensor([i / timehorion]).to(device)
 
-        #                 if i == 0:
-        #                     if args.net == 'TransformerForDiffusion':
-        #                         vt = nets['noise_pred_net'](x0, timestep, obs_cond)
-        #                     elif args.net == 'ConditionalUnet1D':
-        #                         vt = nets['noise_pred_net'](x0, timestep, global_cond=obs_cond)
-                                
-        #                     traj = (vt * 1 / timehorion + x0)
+                        # Save preprocessed image for replay video
+                        replay_images.append(img)
 
-        #                 else:
-        #                     if args.net == 'TransformerForDiffusion':
-        #                         vt = nets['noise_pred_net'](traj, timestep, obs_cond)
-        #                     elif args.net == 'ConditionalUnet1D':
-        #                         vt = nets['noise_pred_net'](traj, timestep, global_cond=obs_cond)
-        #                     traj = (vt * 1 / timehorion + traj)
+                        if not action_plan:
+                            # Finished executing previous action chunk -- compute new chunk
+                            # Prepare observations dict
+                            
 
-        #         naction = traj.detach().to('cpu').numpy()
-        #         naction = naction[0]
-        #         action_pred = pusht.unnormalize_data(naction, stats=stats['action'])
+                            # Query model to get action
+                            t0 = time.time()
+                            action_chunk = client.infer(element)["actions"]
+                            t1 = time.time()
+                            # print('inference time:', t1-t0)
+                            assert action_chunk.shape == (10,7)
+                            # assert (
+                            #     len(action_chunk) >= args.replan_steps
+                            # ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                            action_plan.extend(action_chunk[: args.replan_steps])
 
-        #         # only take action_horizon number of actions
-        #         start = args.obs_horizon - 1
-        #         end = start + args.action_horizon
+                        action = action_plan.popleft()
 
-        #         # execute action_horizon number of steps
-        #         for action in action_pred[start:end, :]:
-        #             # stepping env
-        #             obs, reward, done, _, info = env.step(action)
-        #             # save observations
-        #             obs_deque.append(obs)
-        #             # and reward/vis
-        #             rewards.append(reward)
+                        # Execute action in environment
+                        obs, reward, done, info = env.step(action.tolist())
+                        if done:
+                            task_successes += 1
+                            total_successes += 1
+                            break
+                        t += 1
 
-        #             img = env.render(mode='rgb_array')
-        #             imgs.append(img)
 
-        #             # update progress bar
-        #             step_idx += 1
 
-        #             # pbar.update(1)
-        #             # pbar.set_postfix(reward=reward)
+                    task_episodes += 1
+                    total_episodes += 1
 
-        #             if done:
-        #                 print(f'trial {trail_ix} succeed')
-        #                 n_success += 1
-        #                 break
-                    
-        #             if step_idx > args.max_steps:
-        #                 done = True
-        #                 print(f'trial {trail_ix} fail')
-        #                 break 
+                    # Save a replay video of the episode
+                    suffix = "success" if done else "failure"
+                    task_segment = task_description.replace(" ", "_")
+                    imageio.mimwrite(
+                        pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_trial_{episode_idx}_{suffix}.mp4",
+                        [np.asarray(x) for x in replay_images],
+                        fps=10,
+                    )
 
-        #     final_rewards.append(reward)  
-        #     assert len(final_rewards) == trail_ix + 1     
-        #     print(f'trial eval summary: reward:{sum(final_rewards)/(trail_ix + 1)} SR:{n_success / (trail_ix+1)}')
-        #     print() 
-                    
-        # print(colored(f'final eval summary epoch #{epoch}:  reward:{np.array(final_rewards).mean()}  SR:{n_success / args.n_test}', 'green'))
+                    # Log current results
+                    # logging.info(f"Success: {done}")
+                    # logging.info(f"# episodes completed so far: {total_episodes}")
+                    # logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+                    if done:
+                        print('success!')
+                    else:
+                        print('failure!')
+                print(f'task_summary --> task:{task_description} Total episodes: {task_episodes} SR:{float(task_successes) / float(task_episodes)}')
 
+            # print(f'final_summary --> Total episodes: {total_episodes} SR:{float(total_successes) / float(total_episodes)}')
+            
+            
+            print('-'*20)    
     
+    
+
