@@ -29,6 +29,10 @@ from unet import ConditionalUnet1D
 assert torch.cuda.is_available()
 device = 'cuda'
 
+import functools
+print = functools.partial(print, flush=True)
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
@@ -48,7 +52,9 @@ args = parser.parse_args()
 if args.eval_official:
     args.net = 'ConditionalUnet1D'
 print('args:', args)
- 
+
+if args.eval_official:
+    assert args.obs_horizon == 1
     
 ##################################
 
@@ -57,7 +63,6 @@ os.makedirs('./checkpoints/pusht', exist_ok=True)
 PATH_OFFICIAL_CP = './checkpoints/pusht/flow_pusht.pth'
 
 action_dim = 2
-vision_feature_dim = 514
 
 # create dataset from file
 dataset = pusht.PushTImageDataset(
@@ -104,6 +109,19 @@ print("Num batches:", len(dataloader))
 #     im.save(f"saved_images/sample_{i}_idx_{idx}.png")
 
 # os._exit(0)
+
+# vision_feature_dim = 514
+pos_dim = dataset[0]["agent_pos"].shape[-1]   
+assert pos_dim == action_dim
+per_timestep_cond_dim = 512 + pos_dim         # 514
+
+if args.net == "ConditionalUnet1D":
+    vision_feature_dim = per_timestep_cond_dim * args.obs_horizon   # global cond
+elif args.net == "TransformerForDiffusion":  # TransformerForDiffusion
+    vision_feature_dim = per_timestep_cond_dim                      # per-timestep cond
+
+
+
 
 ##################################################################
 # create network object
@@ -211,11 +229,11 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
         # ema.step(nets.parameters())
         ema.step(ema_params)
         
-        if (args.debug and ii >= 10) or args.eval_official:
+        if (args.debug and ii >= 8) or args.eval_official:
             break
             
-
-    if (epoch % args.eval_interval == 0 and epoch > 0) or args.eval_official :
+    # evaluation below
+    if (epoch % args.eval_interval == 0 and epoch > 0) or args.eval_official or args.debug:
         nets.eval()
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
@@ -257,6 +275,9 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
             done = False
             step_idx = 0
 
+            for x in obs_deque:
+                assert x['image'].min() >= 0 and x['image'].max() <= 1 , 'assertion error at obs_deque init'
+                
             # with tqdm(total=args.max_steps, disable=True, desc="Eval PushTImageEnv") as pbar:
             # print('step_idx:', step_idx)
             while not done:
@@ -272,24 +293,36 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
             
                 x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
                 x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
+                
+                # print('x_img:', x_img.shape) # torch.Size([3, 3, 96, 96]) (O, C, H, W)
+                # print('x_pos:', x_pos.shape) # torch.Size([3, 2]) (O, pos_dim)
+                
                 # infer action
                 with torch.no_grad():
                     # get image features
                     image_features = nets['vision_encoder'](x_img)
-                    obs_features = torch.cat([image_features, x_pos], dim=-1)
                     
+                    image_features = image_features.unsqueeze(0)    # (1, O, 512)
+                    x_pos = x_pos.unsqueeze(0)  # (1, O, 2)
+
+
+                    obs_features = torch.cat([image_features, x_pos], dim=-1)
+                    assert obs_features.shape == (1, args.obs_horizon, 512 + pos_dim)
 
                     if args.net == 'ConditionalUnet1D':
-                        obs_cond = obs_features.unsqueeze(0).flatten(start_dim=1)   
+                        obs_cond = obs_features.flatten(start_dim=1)  
+                        assert obs_cond.shape == (1, args.obs_horizon * (512 + pos_dim))
                     elif args.net == 'TransformerForDiffusion':
-                        obs_cond = obs_features.unsqueeze(0)
-                        
+                        obs_cond = obs_features#.unsqueeze(0)
+                        assert obs_cond.shape == (1, args.obs_horizon, 512 + pos_dim)
+                    
                     timehorion = 16 
                     
                     for i in range(timehorion):
-                        noise = torch.rand(1, args.pred_horizon, action_dim).to(device)
+                        # noise = torch.rand(1, args.pred_horizon, action_dim).to(device)
                         # noise = torch.randn(1, args.pred_horizon, action_dim).to(device)
-                        x0 = noise.expand(x_img.shape[0], -1, -1)
+                        # x0 = noise.expand(x_img.shape[0], -1, -1)
+                        x0 = torch.rand(B, args.pred_horizon, action_dim, device=device) # noise
                         timestep = torch.tensor([i / timehorion]).to(device)
 
                         if i == 0:
@@ -351,5 +384,5 @@ for epoch in tqdm(range( 1 if args.eval_official else args.num_epochs ), desc="T
         print(colored(f'final eval summary epoch #{epoch}:  reward:{np.array(final_rewards).mean()}  SR:{n_success / args.n_test}', 'green'))
 
     
-    if args.eval_official:
+    if args.eval_official or args.debug:
         os._exit(0)
