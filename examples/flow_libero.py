@@ -25,7 +25,7 @@ from torchcfm.utils import *
 from torchcfm.models.models import *
 import pygame,h5py,argparse
 from unet import ConditionalUnet1D
-from utils import *
+# from utils import *
 from datasets import load_dataset
 
 from libero.libero import benchmark
@@ -35,6 +35,9 @@ print('bddl files path:', get_libero_path("bddl_files"))
 
 from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
+from PIL import Image
+from torchvision.transforms.functional import pil_to_tensor
+from datasets import load_dataset
 
 benchmark_dict = benchmark.get_benchmark_dict()
 LIBERO_ENV_RESOLUTION = 256
@@ -44,6 +47,135 @@ video_out_path: str = "./saved_videos"
 
 import functools
 print = functools.partial(print, flush=True)
+
+
+def _to_chw_float(img, normalize_01=True):
+    # img 可能已经是 torch.uint8 CHW（来自 with_transform）
+    if torch.is_tensor(img):
+        t = img
+    else:
+        t = pil_to_tensor(img.convert("RGB"))
+    t = t.float()
+    if normalize_01:
+        t = t / 255.0
+    return t
+
+def hf_transform(ex):
+    # HF 可能传单条：ex["image"] 是 PIL
+    # 也可能传 batch：ex["image"] 是 list[PIL]
+    if "image" in ex:
+        if isinstance(ex["image"], list):
+            ex["image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["image"]]
+        else:
+            ex["image"] = pil_to_tensor(ex["image"].convert("RGB"))
+
+    if "wrist_image" in ex:
+        if isinstance(ex["wrist_image"], list):
+            ex["wrist_image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["wrist_image"]]
+        else:
+            ex["wrist_image"] = pil_to_tensor(ex["wrist_image"].convert("RGB"))
+
+    return ex
+
+class LiberoWindowedDataset(Dataset):
+    """
+    sample:
+      images:       (O, 3, 256, 256)
+      wrist_images: (O, 3, 256, 256)
+      state:        (1, 8)=
+      actions:      (H, 7)  
+    """
+
+    def __init__(self, base_ds, horizon=16, obs_horizon=1, normalize_images_01=True, task_map=None):
+        self.base = base_ds
+        self.H = int(horizon)
+        self.O = int(obs_horizon)
+        assert self.H > 0 and self.O > 0
+        self.normalize_images_01 = normalize_images_01
+        
+        # task_map: {task_index(int) -> natural language instruction(str)}
+        self.task_map = task_map
+        assert self.task_map is not None and len(self.task_map) == 40
+        self.task_index_arr = np.asarray(self.base["task_index"], dtype=np.int64)
+
+        eps = self.base["episode_index"]
+        fis = self.base["frame_index"]
+        
+        self.eps = np.asarray(eps, dtype=np.int64)
+        self.fis = np.asarray(fis, dtype=np.int64)
+        
+        assert isinstance(eps[0], (int, np.integer)), f"episode_index type: {type(eps[0])}"
+
+        self.actions = np.asarray(self.base["actions"], dtype=np.float32)  # (N,7)
+        self.state   = np.asarray(self.base["state"], dtype=np.float32)    # (N,8)
+
+      
+        def ep_scalar(x):
+            if isinstance(x, (list, tuple)) and len(x) == 1:
+                return int(x[0])
+            try:
+                return int(x)
+            except Exception:
+                return int(x[0])
+
+        episodes = {}
+        for i, e in enumerate(eps):
+            ep = ep_scalar(e)
+            episodes.setdefault(ep, []).append(i)
+
+                
+        # t 是 episode 内观测起点；需要 O 帧观测 + H 步未来动作
+        need = self.O + self.H
+        self.windows = []
+        for ep, idxs in episodes.items():
+            L = len(idxs)
+            if L >= need:
+                for t in range(0, L - need + 1):
+                    self.windows.append((idxs, t))
+
+        print(f"[LiberoWindowedDataset] episodes={len(episodes)}, windows={len(self.windows)}")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        idxs, t = self.windows[idx]
+
+        obs_ids = np.asarray(idxs[t : t + self.O], dtype=np.int64)
+        act_ids = np.asarray(idxs[t + self.O : t + self.O + self.H], dtype=np.int64)
+
+        if idx % 1024 == 0:
+            ids = np.concatenate([obs_ids, act_ids])
+            f = self.fis[ids]
+            assert np.all(f[1:] > f[:-1]), f"frame_index not increasing: {f.tolist()}"
+            ep0 = self.eps[ids[0]]
+            assert np.all(self.eps[ids] == ep0), "cross-episode contamination"
+
+        actions = torch.from_numpy(self.actions[act_ids])              # (H,7)
+        state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
+
+        images = torch.stack([_to_chw_float(self.base[i]["image"], normalize_01=self.normalize_images_01)
+                            for i in obs_ids], dim=0)
+        wrist_images = torch.stack([_to_chw_float(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
+                                    for i in obs_ids], dim=0)
+        sample = {"actions": actions, "state": state0, "image": images, "wrist_image": wrist_images}
+        ti = int(self.task_index_arr[obs_ids[0]])
+        sample["task_text"] = self.task_map[ti]
+        
+        return sample
+
+from torch.utils.data._utils.collate import default_collate
+
+def collate_with_task_text(batch):
+    task_text = [b["task_text"] for b in batch]  # 必定存在
+    batch2 = []
+    for b in batch:
+        b = dict(b)
+        b.pop("task_text")
+        batch2.append(b)
+    out = default_collate(batch2)
+    out["task_text"] = task_text
+    return out
 
 
 def _get_libero_env(task, resolution, seed):
@@ -100,19 +232,22 @@ parser.add_argument("--debug", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=10)
 parser.add_argument("--num_epochs", type=int, default=5000)
-parser.add_argument("--batchsize", type=int, default=64)
+parser.add_argument("--batchsize", type=int, default=128)
 parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
 parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
-parser.add_argument("--eval_cp", type=str, default="./checkpoints/libero/cp-ConditionalUnet1D-300.pth")
+parser.add_argument( "--save_video", action='store_true')
+parser.add_argument( "--save_cp", action='store_true')
+parser.add_argument("--eval_cp", type=str, default="./checkpoints/libero/cp-ConditionalUnet1D-400.pth")
+parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
 print('args:', args)
  
 ##################################
-
+hf_dataset_repo = "physical-intelligence/libero"
 action_dim = 7
 
 per_timestep_cond_dim = 512*2 + 8  # 1032
@@ -122,16 +257,30 @@ elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 
     global_cond_dim = per_timestep_cond_dim
 
 
-ds_name = "physical-intelligence/libero"
-base_ds = load_dataset(ds_name, split="train")  # :contentReference[oaicite:3]{index=3}
+base_ds = load_dataset(hf_dataset_repo, split="train")  # :contentReference[oaicite:3]{index=3}
 print('base_ds info:', base_ds, '\n', base_ds.features)
 print(type(base_ds[0]["image"]))
+task_indices = base_ds['task_index']
+assert len(set(task_indices)) == 40 and min(task_indices) == 0 and max(task_indices) == 39
+
+meta = load_dataset(
+    hf_dataset_repo,
+    data_files="meta/tasks.jsonl",
+    split="train",
+)
+task_map = {row["task_index"]: row["task"] for row in meta}
+
 base_ds = base_ds.with_transform(hf_transform)
-ds = LiberoWindowedDataset(base_ds, horizon=args.pred_horizon, obs_horizon=args.obs_horizon, normalize_images_01=args.normalize_images_01)
+ds = LiberoWindowedDataset(base_ds, 
+                           horizon=args.pred_horizon, 
+                           obs_horizon=args.obs_horizon, 
+                           normalize_images_01=args.normalize_images_01, 
+                           task_map=task_map)
 
 dataloader = DataLoader(ds, batch_size=args.batchsize, shuffle=True, 
                             num_workers=16, pin_memory=True,
-                            persistent_workers=True, prefetch_factor=4)
+                            persistent_workers=True, prefetch_factor=4,
+                            collate_fn=collate_with_task_text)
 
 batch = next(iter(dataloader))
 print(batch.keys())
@@ -139,7 +288,13 @@ print('actions:', batch["actions"].shape)       # torch.Size([64, 16, 7])
 print('state:', batch["state"].shape)         # torch.Size([64, 1, 8])
 print('image:', batch["image"].shape)         # torch.Size([64, 1, 3, 256, 256])
 print('wrist_image:', batch["wrist_image"].shape)   # torch.Size([64, 1, 3, 256, 256])
-print()
+print('task_text:', len(batch['task_text']))
+assert isinstance(batch["task_text"], list)
+# for tt in batch['task_text']:
+#     print(tt)
+
+
+# os._exit(0)
 
 if args.save_image:
     imgs = batch["image"]   # shape: [B, O, 3, 256, 256]
@@ -151,8 +306,6 @@ if args.save_image:
         img = img.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         Image.fromarray(img).save(f"saved_images/libero_hf_image_{i}.png")
 # images are in normal orientation
-
-
 
 
 # create network object
@@ -334,19 +487,21 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
 
-        # os.makedirs("./checkpoints/libero", exist_ok=True)
-        # ema.store(ema_params) 
-        # ema.copy_to(ema_params)
-        
-        # torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
-        #             'noise_pred_net': nets['noise_pred_net'].state_dict(),
-        #             'epoch': epoch,
-        #             'ema': ema.state_dict(),
-        #             'optimizer': optimizer.state_dict(),
-        #             'lr_scheduler': lr_scheduler.state_dict(),
-        #             "args": vars(args)}, 
-        #             f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
-        # ema.restore(ema_params)
+        if args.save_cp:
+            os.makedirs("./checkpoints/libero", exist_ok=True)
+            ema.store(ema_params) 
+            ema.copy_to(ema_params)
+            
+            torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
+                        'noise_pred_net': nets['noise_pred_net'].state_dict(),
+                        'epoch': epoch,
+                        'ema': ema.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        "args": vars(args)}, 
+                        f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
+            ema.restore(ema_params)
+            
         if args.eval_official:
             nets.eval()
             state_dict = torch.load(args.eval_cp, map_location='cuda')
@@ -379,25 +534,29 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                 raise ValueError(f"Unknown task suite: {task_suite_name}")
             
             task_ll = list(range(task_suite.n_tasks))
-            random.shuffle(task_ll)
+            # random.shuffle(task_ll)
             
             for task_id in task_ll:
                 replay_images = []
                 task = task_suite.get_task(task_id)
 
-                # Get default LIBERO initial states
-                initial_states = task_suite.get_task_init_states(task_id)
-                if len(initial_states) != 50:
-                    print(task_id , 'initial_states length:', len(initial_states))
-                    continue
-                assert len(initial_states) >= 50
-
                 # Initialize LIBERO environment and task description
                 env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, random.randint(1, 10000))
                 # Start episodes
                 print(f'task_id:{task_id} task_description:{task_description}')
+                
+                # Get default LIBERO initial states
+                initial_states = task_suite.get_task_init_states(task_id)
+                if len(initial_states) < 50:
+                    print(task_id , 'initial_states length < 50 :', len(initial_states))
+                
+                n_test_actual = min(len(initial_states), args.n_test)
+
+                # print('initial_states cnt:', len(initial_states), '\n')
+                # continue
+
                 n_success = 0
-                for trail_ix in range(args.n_test):
+                for trail_ix in range(n_test_actual):
 
                     # Reset environment
                     env.reset()
@@ -428,15 +587,15 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             assert x["agentview_image"].shape == (256, 256, 3) and x["agentview_image"].dtype == np.uint8
                             assert x["robot0_eye_in_hand_image"].shape == (256, 256, 3) and x["robot0_eye_in_hand_image"].dtype == np.uint8
                         
-                        if args.save_image:
+                        if args.save_image and step_idx in [0, 50, 100, 150, 200]:
                             x = obs_deque[-1]
                             # save original images (HWC, unit 8)
-                            Image.fromarray(x["agentview_image"]).save(f"saved_images/libero_agentview_image.png")
-                            Image.fromarray(x["robot0_eye_in_hand_image"]).save(f"saved_images/libero_robot0_eye_in_hand_image.png")
+                            Image.fromarray(x["agentview_image"]).save(f"saved_images/libero_agentview_image_{step_idx}.png")
+                            Image.fromarray(x["robot0_eye_in_hand_image"]).save(f"saved_images/libero_robot0_eye_in_hand_image_{step_idx}.png")
 
                             # 180 degree flip, still HWC unit 8
-                            Image.fromarray(np.ascontiguousarray(x["agentview_image"][::-1, ::-1, :])).save(f"saved_images/libero_agentview_image_flip.png")
-                            Image.fromarray(np.ascontiguousarray(x["robot0_eye_in_hand_image"][::-1, ::-1, :])).save(f"saved_images/libero_robot0_eye_in_hand_image_flip.png")                        
+                            Image.fromarray(np.ascontiguousarray(x["agentview_image"][::-1, ::-1, :])).save(f"saved_images/libero_agentview_image_flip_{step_idx}.png")
+                            Image.fromarray(np.ascontiguousarray(x["robot0_eye_in_hand_image"][::-1, ::-1, :])).save(f"saved_images/libero_robot0_eye_in_hand_image_flip_{step_idx}.png")                        
                             
                         
                         x_main_img = np.stack([
@@ -458,10 +617,15 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         x_pos = np.stack([get_state(x) for x in obs_deque])[None, ...]
                       
                         assert isinstance(x_main_img, np.ndarray) and isinstance(x_wrist_image, np.ndarray) and isinstance(x_pos, np.ndarray)
+                        assert x_main_img.max() > 1 and x_wrist_image.max() > 1 and x_main_img.min() >= 0 and x_wrist_image.min() >= 0
                         # print('infer x_main_img:', x_main_img.shape)
                         # print('infer x_wrist_image:', x_wrist_image.shape)
                         # print('infer x_pos:', x_pos.shape)
-                                               
+                        
+                        if args.normalize_images_01:
+                            x_main_img /= 255.0  
+                            x_wrist_image /= 255.0 
+                                             
                         x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.float32)
                         x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.float32)
                         x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)        
@@ -561,13 +725,22 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                                 break 
                             
                             
-                imageio.mimwrite( f"./saved_videos/rollout_{task_suite_name}_task_{task_id}_success{n_success}_total{args.n_test}.mp4", [np.asarray(x) for x in replay_images], fps=10)
-                print(f'task summary --> suite: {task_suite_name} task: {task_id} {task_description} SR:{n_success / args.n_test}')
+                
+                if args.debug or args.eval_official:
+                    epoch_ = 'eval_official'
+                else:
+                    epoch_ = epoch
+                
+                if args.save_video:
+                    imageio.mimwrite( f"./saved_videos/rollout_{args.video_name}_epoch_{epoch_}_{task_suite_name}_taskid_{task_id}_success_{n_success}_total_{n_test_actual}.mp4", [np.asarray(x) for x in replay_images], fps=10)
+                    
+                print(f'task summary --> epoch: {epoch_} suite: {task_suite_name} task_id: {task_id} ({task_description}); success rate:{n_success / n_test_actual} n_test:{n_test_actual}')
                 print()
                 env.close()
 
  
             print('-'*20)    
-    
+    if args.debug or args.eval_official:
+        break
     
 
