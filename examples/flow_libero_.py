@@ -25,7 +25,6 @@ from torchcfm.utils import *
 from torchcfm.models.models import *
 import pygame,h5py,argparse
 from unet import ConditionalUnet1D
-from transformers import AutoTokenizer, AutoModel
 # from utils import *
 from datasets import load_dataset
 
@@ -48,9 +47,6 @@ video_out_path: str = "./saved_videos"
 
 import functools
 print = functools.partial(print, flush=True)
-
-# Avoid tokenizer parallelism warnings when DataLoader forks
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _to_chw_float(img, normalize_01=True):
@@ -241,9 +237,6 @@ parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
-parser.add_argument("--text_model", type=str, default="Qwen/Qwen2.5-0.5B")
-parser.add_argument("--text_max_len", type=int, default=64)
-parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
 parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
 parser.add_argument( "--save_video", action='store_true')
@@ -256,6 +249,14 @@ print('args:', args)
 ##################################
 hf_dataset_repo = "physical-intelligence/libero"
 action_dim = 7
+
+per_timestep_cond_dim = 512*2 + 8  # 1032
+if args.net == "ConditionalUnet1D":
+    global_cond_dim = per_timestep_cond_dim * args.obs_horizon
+elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
+    global_cond_dim = per_timestep_cond_dim
+
+
 base_ds = load_dataset(hf_dataset_repo, split="train")  # :contentReference[oaicite:3]{index=3}
 print('base_ds info:', base_ds, '\n', base_ds.features)
 print(type(base_ds[0]["image"]))
@@ -268,21 +269,6 @@ meta = load_dataset(
     split="train",
 )
 task_map = {row["task_index"]: row["task"] for row in meta}
-task_texts = [task_map[i] for i in sorted(task_map.keys())]
-tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-task_text_enc = tokenizer(
-    task_texts,
-    padding="max_length",
-    truncation=True,
-    max_length=args.text_max_len,
-    return_tensors="pt",
-)
-task_text_inputs = {
-    t: (task_text_enc["input_ids"][i], task_text_enc["attention_mask"][i])
-    for i, t in enumerate(task_texts)
-}
 
 base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
@@ -325,19 +311,6 @@ if args.save_image:
 # create network object
 vision_encoder = get_resnet('resnet18')
 vision_encoder = replace_bn_with_gn(vision_encoder)
-assert torch.cuda.is_available(), "CUDA is required for bf16 training"
-assert torch.cuda.is_bf16_supported(), "GPU does not support bf16"
-text_encoder = AutoModel.from_pretrained(
-    args.text_model,
-    torch_dtype=torch.bfloat16,
-)
-text_embed_dim = int(text_encoder.config.hidden_size)
-per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
-if args.net == "ConditionalUnet1D":
-    global_cond_dim = per_timestep_cond_dim * args.obs_horizon
-elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
-    global_cond_dim = per_timestep_cond_dim
-
 if args.net == 'TransformerForDiffusion':
     noise_pred_net = TransformerForDiffusion(
         input_dim=action_dim,
@@ -355,9 +328,8 @@ else:
 
 nets = nn.ModuleDict({
     'vision_encoder': vision_encoder,
-    'text_encoder': text_encoder,
     'noise_pred_net': noise_pred_net
-}).to(device, dtype=torch.bfloat16)
+}).to(device)
     
 if args.frozen_vision:
     nets['vision_encoder'].eval()  # important: disable GN/Dropout behavior changes
@@ -395,9 +367,11 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
     for ii, batch in enumerate(pbar):
+            
         batch_wrist_image_min, batch_wrist_image_max = batch['wrist_image'].min().item(), batch['wrist_image'].max().item()
         batch_main_image_min, batch_main_image_max = batch['image'].min().item(), batch['image'].max().item()
 
+        
         if args.normalize_images_01:
             assert batch_wrist_image_min >= 0 and batch_wrist_image_max <= 1, 'wrist_image range error'
             assert batch_main_image_min >= 0 and batch_main_image_max <= 1, 'image range error'
@@ -409,19 +383,14 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         
         batch_state_min = batch['state'].min()
         batch_state_max = batch['state'].max()
-        assert batch_state_min >= -3.14*2 and batch_state_max <= 3.14*2, f'state range error: {batch_state_min} {batch_state_max}'
+        assert batch['state'].min() >= -3.14*2 and batch['state'].max() <= 3.14*2 and batch['state'].min() < -1 and batch['state'].max() > 1, \
+                f'state range error: {batch_state_min} {batch_state_max}'
 
-        x_main_img = batch['image'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_wrist_image = batch['wrist_image'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_pos = batch['state'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_traj = batch['actions'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_task_ids = torch.stack([task_text_inputs[t][0] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
-        x_task_mask = torch.stack([task_text_inputs[t][1] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
-        if args.debug:
-            assert x_main_img.dtype == torch.bfloat16 and x_wrist_image.dtype == torch.bfloat16
-            assert x_pos.dtype == torch.bfloat16 and x_traj.dtype == torch.bfloat16
-            assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
-            
+        x_main_img = batch['image'].to(device, non_blocking=True).float()
+        x_wrist_image = batch['wrist_image'].to(device, non_blocking=True).float()
+        x_pos = batch['state'].to(device, non_blocking=True).float()
+        x_traj = batch['actions'].to(device, non_blocking=True).float()
+        
         # print('train x_main_img:', x_main_img.shape)
         # print('train x_wrist_image:', x_wrist_image.shape)
         # print('train x_pos:', x_pos.shape)
@@ -437,20 +406,17 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # train x_pos_rep: torch.Size([64, 1, 8])
         # train obs_features: torch.Size([64, 1, 1032])
                 
-        x0 = torch.randn(x_traj.shape, device=device, dtype=torch.bfloat16)
+        x0 = torch.randn(x_traj.shape, device=device)
         timestep, xt, ut = FM.sample_location_and_conditional_flow(x0, x_traj)
-        timestep = timestep.to(dtype=torch.bfloat16)
-        xt = xt.to(dtype=torch.bfloat16)
-        ut = ut.to(dtype=torch.bfloat16)
 
         # encoder vision features
         if args.frozen_vision:
             with torch.no_grad():
-                image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
+                image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1))
+                image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1))
         else:
-            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
+            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1))
+            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1))
 
         # print(x_main_img.shape, x_main_img.flatten(end_dim=1).shape, image_main_features_visencoder.shape)
         # print('train image_main_features_visencoder:', image_main_features_visencoder.shape)
@@ -467,30 +433,14 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
         else:
             x_pos_rep = x_pos  # already is of shape [B,O,8] or O=1
-        if args.debug:
-            assert x_pos_rep.shape[:2] == main_feat.shape[:2]
-
-        text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
-        last_hidden = text_out.last_hidden_state  # [B, L, D]
-        if args.text_pool == "last":
-            idx = x_task_mask.sum(dim=1) - 1
-            idx = idx.clamp(min=0)
-            text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
-        else:
-            mask = x_task_mask.unsqueeze(-1)
-            text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        text_feat = text_feat.unsqueeze(1).expand(-1, main_feat.shape[1], -1)  # [B, O, D]
-        if args.debug:
-            assert text_feat.shape[:2] == main_feat.shape[:2]
-            assert text_feat.dtype == torch.bfloat16
         
         # print('train x_pos_rep:', x_pos_rep.shape) 
          
-        obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
+        obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
         # print('train obs_features:', obs_features.shape) 
         
         # expected dimension of per-timestep cond 
-        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
+        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1]
 
         B, O = x_main_img.shape[:2]
 
@@ -676,19 +626,16 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             x_main_img /= 255.0  
                             x_wrist_image /= 255.0 
                                              
-                        x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.bfloat16)
-                        x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.bfloat16)
-                        x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.bfloat16)
-                        if args.debug:
-                            assert x_main_img.dtype == torch.bfloat16 and x_wrist_image.dtype == torch.bfloat16
-                            assert x_pos.dtype == torch.bfloat16
+                        x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.float32)
+                        x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.float32)
+                        x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)        
 
                         assert x_main_img.shape == (B, args.obs_horizon, 3, 256, 256) == x_wrist_image.shape
                         assert x_pos.shape == (B, args.obs_horizon, 8)
                         with torch.no_grad():
                             
-                            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
+                            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1))
+                            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1))
                             assert image_main_features_visencoder.shape == image_wrist_features_visencoder.shape 
                             assert image_main_features_visencoder.shape == (B*args.obs_horizon, 512), f'assert shape error: {image_main_features_visencoder.shape}'
                             
@@ -704,37 +651,12 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             assert x_pos_rep.shape == (B, args.obs_horizon, 8)
                             
                             # print('infer x_pos_rep:', x_pos_rep.shape) 
-                            text_enc = tokenizer(
-                                [task_description],
-                                padding="max_length",
-                                truncation=True,
-                                max_length=args.text_max_len,
-                                return_tensors="pt",
-                            )
-                            x_task_ids = text_enc["input_ids"].to(device, non_blocking=True)
-                            x_task_mask = text_enc["attention_mask"].to(device, non_blocking=True)
-                            if args.debug:
-                                assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
-                            text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
-                            last_hidden = text_out.last_hidden_state  # [1, L, D]
-                            if args.text_pool == "last":
-                                idx = x_task_mask.sum(dim=1) - 1
-                                idx = idx.clamp(min=0)
-                                text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
-                            else:
-                                mask = x_task_mask.unsqueeze(-1)
-                                text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                            text_feat = text_feat.to(dtype=torch.bfloat16)
-                            text_feat = text_feat.unsqueeze(1).expand(B, main_feat.shape[1], -1)  # [B, O, D]
-                            if args.debug:
-                                assert text_feat.shape[:2] == main_feat.shape[:2]
-                                assert text_feat.dtype == torch.bfloat16
-
-                            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
+                            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
                             # print('infer obs_features:', obs_features.shape) 
+                            assert obs_features.shape == (B, args.obs_horizon, 1032)
                         
                         # expected dimension of per-timestep cond 
-                        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
+                        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1]
 
                         B, O, D = obs_features.shape
                         # 1) check obs_features 
@@ -751,19 +673,10 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             
                         timehorion = 16 
                         
-                        obs_features = obs_features.to(dtype=torch.bfloat16)
-                        if args.net == 'ConditionalUnet1D':
-                            obs_cond = obs_cond.to(dtype=torch.bfloat16)
-                        if args.debug:
-                            assert obs_features.dtype == torch.bfloat16
-                            if args.net == 'ConditionalUnet1D':
-                                assert obs_cond.dtype == torch.bfloat16
-                        x0 = torch.rand(B, args.pred_horizon, action_dim, device=device, dtype=torch.bfloat16) # noise
+                        x0 = torch.rand(B, args.pred_horizon, action_dim, device=device) # noise
                         for i in range(timehorion):
                             # x0 = torch.rand(B, args.pred_horizon, action_dim, device=device) # noise
-                            timestep = torch.tensor([i / timehorion], device=device, dtype=torch.bfloat16)
-                            if args.debug:
-                                assert timestep.dtype == torch.bfloat16
+                            timestep = torch.tensor([i / timehorion]).to(device)
                             
                             if i == 0:
                                 if args.net == 'TransformerForDiffusion':
@@ -780,7 +693,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                                     vt = nets['noise_pred_net'](traj, timestep, global_cond=obs_cond)
                                 traj = (vt * 1 / timehorion + traj)                        
 
-                        action_pred = traj.detach().to(dtype=torch.float32, device='cpu').numpy()
+                        action_pred = traj.detach().to('cpu').numpy()
                         # print('action_pred:', action_pred.shape) # (1, 16, 7)
                         assert action_pred.shape == (1, 16, 7)
                         start = args.obs_horizon - 1
@@ -830,3 +743,4 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     if args.debug or args.eval_official:
         break
     
+
