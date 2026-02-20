@@ -2,3 +2,5 @@ checkpoints/
 saved_images/
 dataset/
 *.log
+saved_videos/
+logs/

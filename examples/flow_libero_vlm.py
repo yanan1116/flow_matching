@@ -25,7 +25,8 @@ from torchcfm.utils import *
 from torchcfm.models.models import *
 import pygame,h5py,argparse
 from unet import ConditionalUnet1D
-from transformers import AutoTokenizer, AutoModel
+import transformers
+from transformers import AutoTokenizer, AutoModel, AutoProcessor
 # from utils import *
 from datasets import load_dataset
 
@@ -181,6 +182,160 @@ def collate_with_task_text(batch):
     out["task_text"] = task_text
     return out
 
+def _chw_float_to_hwc_uint8_np(img_chw, normalize_01):
+    t = img_chw.detach().to("cpu")
+    if t.dtype == torch.bfloat16:
+        t = t.to(torch.float32)
+    if normalize_01:
+        t = (t.clamp(0, 1) * 255.0).round()
+    else:
+        t = t.clamp(0, 255)
+    return t.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+
+def _extract_pooled_feature(model_out, attention_mask=None):
+    if hasattr(model_out, "pooler_output") and model_out.pooler_output is not None:
+        return model_out.pooler_output
+
+    if hasattr(model_out, "last_hidden_state") and model_out.last_hidden_state is not None:
+        h = model_out.last_hidden_state
+        if h.ndim == 3 and attention_mask is not None and attention_mask.shape[0] == h.shape[0]:
+            m = attention_mask.to(h.device).unsqueeze(-1).to(dtype=h.dtype)
+            return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        if h.ndim == 3:
+            return h[:, -1]
+        return h
+
+    if hasattr(model_out, "hidden_states") and model_out.hidden_states is not None and len(model_out.hidden_states) > 0:
+        h = model_out.hidden_states[-1]
+        if h.ndim == 3 and attention_mask is not None and attention_mask.shape[0] == h.shape[0]:
+            m = attention_mask.to(h.device).unsqueeze(-1).to(dtype=h.dtype)
+            return (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        if h.ndim == 3:
+            return h[:, -1]
+        return h
+
+    if isinstance(model_out, tuple) and len(model_out) > 0:
+        h = model_out[0]
+        if torch.is_tensor(h) and h.ndim == 3:
+            return h[:, -1]
+        if torch.is_tensor(h):
+            return h
+
+    raise RuntimeError("Cannot extract pooled feature from VLM output.")
+
+def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs):
+    # image_pairs: List[List[np.ndarray(H, W, 3), np.ndarray(H, W, 3)]]
+    use_chat_template = hasattr(vlm_processor, "apply_chat_template")
+    if use_chat_template:
+        texts = []
+        for p in prompts:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "image"},
+                        {"type": "text", "text": p},
+                    ],
+                }
+            ]
+            txt = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            texts.append(txt)
+    else:
+        texts = prompts
+    return texts, image_pairs
+
+def _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len):
+    proc_kwargs = dict(
+        text=texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=False,
+    )
+    # For VLM multi-image prompts, truncation may cut image placeholder tokens
+    # and cause processor-side image token mismatch.
+    _ = text_max_len
+
+    # Try several input formats because processor image APIs differ by model/version.
+    attempts = [
+        dict(proc_kwargs, images=image_pairs),
+        dict(proc_kwargs, images=[img for pair in image_pairs for img in pair]),
+    ]
+    last_err = None
+    for kw in attempts:
+        try:
+            return vlm_processor(**kw)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"VLM processor input formatting failed. Last error: {last_err}")
+
+def _get_vlm_hidden_size(vlm_encoder):
+    cfg = vlm_encoder.config
+    if hasattr(cfg, "hidden_size"):
+        return int(cfg.hidden_size)
+    for key in ["text_config", "language_config", "llm_config"]:
+        sub_cfg = getattr(cfg, key, None)
+        if sub_cfg is not None and hasattr(sub_cfg, "hidden_size"):
+            return int(sub_cfg.hidden_size)
+    raise RuntimeError("Cannot infer hidden size from VLM config.")
+
+def _load_vlm_encoder(model_name, dtype):
+    try:
+        return AutoModel.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        )
+    except Exception as e_auto:
+        auto_v2s = getattr(transformers, "AutoModelForVision2Seq", None)
+        if auto_v2s is not None:
+            try:
+                return auto_v2s.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                )
+            except Exception:
+                pass
+        ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+        if "Qwen3-VL" in model_name and ver < (4, 50):
+            raise RuntimeError(
+                f"{model_name} may require newer transformers than {transformers.__version__}. "
+                f"Please upgrade transformers or use an older VLM checkpoint."
+            ) from e_auto
+        raise
+
+def encode_vlm_obs_features(
+    vlm_encoder,
+    vlm_processor,
+    x_main_img,
+    x_wrist_image,
+    task_texts,
+    normalize_images_01,
+    text_max_len,
+    device,
+):
+    B, O = x_main_img.shape[:2]
+    prompts = []
+    image_pairs = []
+    for b in range(B):
+        prompt = task_texts[b]
+        for o in range(O):
+            prompts.append(prompt)
+            img_main = _chw_float_to_hwc_uint8_np(x_main_img[b, o], normalize_01=normalize_images_01)
+            img_wrist = _chw_float_to_hwc_uint8_np(x_wrist_image[b, o], normalize_01=normalize_images_01)
+            image_pairs.append([img_main, img_wrist])
+    texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs)
+    vlm_inputs = _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len)
+    for k, v in list(vlm_inputs.items()):
+        if torch.is_tensor(v):
+            vlm_inputs[k] = v.to(device=device, non_blocking=True)
+
+    out = vlm_encoder(**vlm_inputs, output_hidden_states=True, return_dict=True)
+    pooled = _extract_pooled_feature(out, attention_mask=vlm_inputs.get("attention_mask"))
+    pooled = pooled.to(dtype=torch.bfloat16)
+    return pooled.view(B, O, -1)
+
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
@@ -231,23 +386,26 @@ assert torch.cuda.is_available()
 device = 'cuda'
 parser = argparse.ArgumentParser()
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
-parser.add_argument("--frozen_vision", action="store_true")
+# parser.add_argument("--frozen_vision", action="store_true")
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
-parser.add_argument("--n_test", type=int, default=10)
-parser.add_argument("--num_epochs", type=int, default=5000)
+parser.add_argument("--n_test", type=int, default=50)
+parser.add_argument("--num_epochs", type=int, default=1000)
 parser.add_argument("--batchsize", type=int, default=128)
-parser.add_argument("--eval_interval", type=int, default=100)
+parser.add_argument("--eval_interval", type=int, default=50)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
-parser.add_argument("--text_model", type=str, default="Qwen/Qwen2.5-0.5B")
+parser.add_argument("--encoder_mode", type=str, default="separate", choices=["separate", "vlm"])
+parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
-parser.add_argument( "--eval_official", action='store_true')
-parser.add_argument( "--save_image", action='store_true')
-parser.add_argument( "--save_video", action='store_true')
-parser.add_argument( "--save_cp", action='store_true')
+parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen3-VL-4B-Thinking")
+parser.add_argument("--frozen_vlm", action="store_true")
+parser.add_argument("--eval_official", action='store_true')
+parser.add_argument("--save_image", action='store_true')
+parser.add_argument("--save_video", action='store_true')
+parser.add_argument("--save_cp", action='store_true')
 parser.add_argument("--eval_cp", type=str, default="./checkpoints/libero/cp-ConditionalUnet1D-400.pth")
 parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
@@ -269,20 +427,26 @@ meta = load_dataset(
 )
 task_map = {row["task_index"]: row["task"] for row in meta}
 task_texts = [task_map[i] for i in sorted(task_map.keys())]
-tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-task_text_enc = tokenizer(
-    task_texts,
-    padding="max_length",
-    truncation=True,
-    max_length=args.text_max_len,
-    return_tensors="pt",
-)
-task_text_inputs = {
-    t: (task_text_enc["input_ids"][i], task_text_enc["attention_mask"][i])
-    for i, t in enumerate(task_texts)
-}
+if args.encoder_mode == "separate":
+    tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    task_text_enc = tokenizer(
+        task_texts,
+        padding="max_length",
+        truncation=True,
+        max_length=args.text_max_len,
+        return_tensors="pt",
+    )
+    task_text_inputs = {
+        t: (task_text_enc["input_ids"][i], task_text_enc["attention_mask"][i])
+        for i, t in enumerate(task_texts)
+    }
+    vlm_processor = None
+else:
+    tokenizer = None
+    task_text_inputs = None
+    vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
 
 base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
@@ -322,17 +486,27 @@ if args.save_image:
 # images are in normal orientation
 
 
-# create network object
-vision_encoder = get_resnet('resnet18')
-vision_encoder = replace_bn_with_gn(vision_encoder)
 assert torch.cuda.is_available(), "CUDA is required for bf16 training"
 assert torch.cuda.is_bf16_supported(), "GPU does not support bf16"
-text_encoder = AutoModel.from_pretrained(
-    args.text_model,
-    torch_dtype=torch.bfloat16,
-)
-text_embed_dim = int(text_encoder.config.hidden_size)
-per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
+# create network object
+modules = {}
+if args.encoder_mode == "separate":
+    vision_encoder = get_resnet('resnet18')
+    vision_encoder = replace_bn_with_gn(vision_encoder)
+    text_encoder = AutoModel.from_pretrained(
+        args.text_model,
+        torch_dtype=torch.bfloat16,
+    )
+    text_embed_dim = int(text_encoder.config.hidden_size)
+    per_timestep_cond_dim = 512 * 2 + 8 + text_embed_dim
+    modules["vision_encoder"] = vision_encoder
+    modules["text_encoder"] = text_encoder
+else:
+    vlm_encoder = _load_vlm_encoder(args.vlm_model, dtype=torch.bfloat16)
+    vlm_embed_dim = _get_vlm_hidden_size(vlm_encoder)
+    per_timestep_cond_dim = vlm_embed_dim + 8
+    modules["vlm_encoder"] = vlm_encoder
+
 if args.net == "ConditionalUnet1D":
     global_cond_dim = per_timestep_cond_dim * args.obs_horizon
 elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
@@ -353,15 +527,11 @@ elif args.net == 'ConditionalUnet1D':
 else:
     raise ValueError("net not found")
 
-nets = nn.ModuleDict({
-    'vision_encoder': vision_encoder,
-    'text_encoder': text_encoder,
-    'noise_pred_net': noise_pred_net
-}).to(device, dtype=torch.bfloat16)
-    
-if args.frozen_vision:
-    nets['vision_encoder'].eval()  # important: disable GN/Dropout behavior changes
-    for p in nets['vision_encoder'].parameters():
+nets = nn.ModuleDict({**modules, 'noise_pred_net': noise_pred_net}).to(device, dtype=torch.bfloat16)
+
+if args.encoder_mode == "vlm" and args.frozen_vlm:
+    nets["vlm_encoder"].eval()
+    for p in nets["vlm_encoder"].parameters():
         p.requires_grad = False
         
 ##################################################################
@@ -386,41 +556,54 @@ print('model initialized')
 ########################################################################
 #### Train the model
 for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
+
+    if (args.debug or args.eval_official) and epoch > 0 :
+        print('debug or test mode')
+        os._exit(0)
+
+
     total_loss_train = 0.0
     
     nets.train()
-    
-    if args.frozen_vision:
-        nets['vision_encoder'].eval()
+
+    if args.encoder_mode == "vlm" and args.frozen_vlm:
+        nets["vlm_encoder"].eval()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
     for ii, batch in enumerate(pbar):
-        batch_wrist_image_min, batch_wrist_image_max = batch['wrist_image'].min().item(), batch['wrist_image'].max().item()
-        batch_main_image_min, batch_main_image_max = batch['image'].min().item(), batch['image'].max().item()
 
-        if args.normalize_images_01:
-            assert batch_wrist_image_min >= 0 and batch_wrist_image_max <= 1, 'wrist_image range error'
-            assert batch_main_image_min >= 0 and batch_main_image_max <= 1, 'image range error'
-        else:
-            assert batch_wrist_image_min >= 0 and ( 1 <= batch_wrist_image_max <= 255), 'wrist_image range error'
-            assert batch_main_image_min >= 0 and ( 1 <= batch_main_image_max <= 255), 'image range error'
-        
-        assert batch['actions'].min() >= -1 and batch['actions'].max() <= 1, 'actions range error'
-        
-        batch_state_min = batch['state'].min()
-        batch_state_max = batch['state'].max()
-        assert batch_state_min >= -3.14*2 and batch_state_max <= 3.14*2, f'state range error: {batch_state_min} {batch_state_max}'
+        if args.debug:
+            batch_wrist_image_min, batch_wrist_image_max = batch['wrist_image'].min().item(), batch['wrist_image'].max().item()
+            batch_main_image_min, batch_main_image_max = batch['image'].min().item(), batch['image'].max().item()
 
-        x_main_img = batch['image'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_wrist_image = batch['wrist_image'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
+            if args.normalize_images_01:
+                assert batch_wrist_image_min >= 0 and batch_wrist_image_max <= 1, 'wrist_image range error'
+                assert batch_main_image_min >= 0 and batch_main_image_max <= 1, 'image range error'
+            else:
+                assert batch_wrist_image_min >= 0 and ( 1 <= batch_wrist_image_max <= 255), 'wrist_image range error'
+                assert batch_main_image_min >= 0 and ( 1 <= batch_main_image_max <= 255), 'image range error'
+            
+            assert batch['actions'].min() >= -1 and batch['actions'].max() <= 1, 'actions range error'
+        
+            batch_state_min = batch['state'].min()
+            batch_state_max = batch['state'].max()
+            assert batch_state_min >= -3.14*2 and batch_state_max <= 3.14*2, f'state range error: {batch_state_min} {batch_state_max}'
+
+        x_main_img = batch['image']
+        x_wrist_image = batch['wrist_image']
         x_pos = batch['state'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
         x_traj = batch['actions'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
-        x_task_ids = torch.stack([task_text_inputs[t][0] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
-        x_task_mask = torch.stack([task_text_inputs[t][1] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
+        if args.encoder_mode == "separate":
+            x_main_img = x_main_img.to(device, non_blocking=True).to(dtype=torch.bfloat16)
+            x_wrist_image = x_wrist_image.to(device, non_blocking=True).to(dtype=torch.bfloat16)
+            x_task_ids = torch.stack([task_text_inputs[t][0] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
+            x_task_mask = torch.stack([task_text_inputs[t][1] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
+
         if args.debug:
-            assert x_main_img.dtype == torch.bfloat16 and x_wrist_image.dtype == torch.bfloat16
+            if args.encoder_mode == "separate":
+                assert x_main_img.dtype == torch.bfloat16 and x_wrist_image.dtype == torch.bfloat16
+                assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
             assert x_pos.dtype == torch.bfloat16 and x_traj.dtype == torch.bfloat16
-            assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
             
         # print('train x_main_img:', x_main_img.shape)
         # print('train x_wrist_image:', x_wrist_image.shape)
@@ -443,68 +626,84 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         xt = xt.to(dtype=torch.bfloat16)
         ut = ut.to(dtype=torch.bfloat16)
 
-        # encoder vision features
-        if args.frozen_vision:
-            with torch.no_grad():
-                image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
-        else:
+        # encoder features
+        if args.encoder_mode == "separate":
+
             image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
             image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
 
-        # print(x_main_img.shape, x_main_img.flatten(end_dim=1).shape, image_main_features_visencoder.shape)
-        # print('train image_main_features_visencoder:', image_main_features_visencoder.shape)
-        # print('train image_wrist_features_visencoder:', image_wrist_features_visencoder.shape)
-        
-        
-        main_feat  = image_main_features_visencoder.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
-        wrist_feat = image_wrist_features_visencoder.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]
-        
-        # print('train main_feat:', main_feat.shape)
-        # print('train wrist_feat:', wrist_feat.shape)        
-        
-        if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
-            x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
+            main_feat  = image_main_features_visencoder.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
+            wrist_feat = image_wrist_features_visencoder.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]
+
+            if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
+                x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
+            else:
+                x_pos_rep = x_pos  # already is of shape [B,O,8] or O=1
+            if args.debug:
+                assert x_pos_rep.shape[:2] == main_feat.shape[:2]
+
+            text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+            last_hidden = text_out.last_hidden_state  # [B, L, D]
+            if args.text_pool == "last":
+                idx = x_task_mask.sum(dim=1) - 1
+                idx = idx.clamp(min=0)
+                text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
+            else:
+                mask = x_task_mask.unsqueeze(-1)
+                text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            text_feat = text_feat.unsqueeze(1).expand(-1, main_feat.shape[1], -1)  # [B, O, D]
+
+            if args.debug:
+                assert text_feat.shape[:2] == main_feat.shape[:2]
+                assert text_feat.dtype == torch.bfloat16
+
+            obs_features = torch.cat([main_feat, wrist_feat, x_pos_rep, text_feat], dim=-1)
+            expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
         else:
-            x_pos_rep = x_pos  # already is of shape [B,O,8] or O=1
+            if args.frozen_vlm:
+                with torch.no_grad():
+                    vlm_feat = encode_vlm_obs_features(
+                        vlm_encoder=nets["vlm_encoder"],
+                        vlm_processor=vlm_processor,
+                        x_main_img=x_main_img,
+                        x_wrist_image=x_wrist_image,
+                        task_texts=batch["task_text"],
+                        normalize_images_01=args.normalize_images_01,
+                        text_max_len=args.text_max_len,
+                        device=device,
+                    )
+            else:
+                vlm_feat = encode_vlm_obs_features(
+                    vlm_encoder=nets["vlm_encoder"],
+                    vlm_processor=vlm_processor,
+                    x_main_img=x_main_img,
+                    x_wrist_image=x_wrist_image,
+                    task_texts=batch["task_text"],
+                    normalize_images_01=args.normalize_images_01,
+                    text_max_len=args.text_max_len,
+                    device=device,
+                )
+            if x_pos.shape[1] == 1 and vlm_feat.shape[1] > 1:
+                x_pos_rep = x_pos.expand(-1, vlm_feat.shape[1], -1)
+            else:
+                x_pos_rep = x_pos
+            obs_features = torch.cat([vlm_feat, x_pos_rep], dim=-1)
+            expected_feat_dim = vlm_feat.shape[-1] + x_pos_rep.shape[-1]
+
+        B, O = obs_features.shape[:2]
+
         if args.debug:
-            assert x_pos_rep.shape[:2] == main_feat.shape[:2]
-
-        text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
-        last_hidden = text_out.last_hidden_state  # [B, L, D]
-        if args.text_pool == "last":
-            idx = x_task_mask.sum(dim=1) - 1
-            idx = idx.clamp(min=0)
-            text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
-        else:
-            mask = x_task_mask.unsqueeze(-1)
-            text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        text_feat = text_feat.unsqueeze(1).expand(-1, main_feat.shape[1], -1)  # [B, O, D]
-        if args.debug:
-            assert text_feat.shape[:2] == main_feat.shape[:2]
-            assert text_feat.dtype == torch.bfloat16
-        
-        # print('train x_pos_rep:', x_pos_rep.shape) 
-         
-        obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
-        # print('train obs_features:', obs_features.shape) 
-        
-        # expected dimension of per-timestep cond 
-        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
-
-        B, O = x_main_img.shape[:2]
-
-        # 1) check obs_features 
-        assert obs_features.shape == (B, O, expected_feat_dim), f"obs_features shape wrong: got {obs_features.shape}, expect {(B, O, expected_feat_dim)}"
+            # 1) check obs_features 
+            assert obs_features.shape == (B, O, expected_feat_dim), f"obs_features shape wrong: got {obs_features.shape}, expect {(B, O, expected_feat_dim)}"
 
         # 2) check the shape before feed to nets
         if args.net == 'ConditionalUnet1D':
             flat = obs_features.flatten(start_dim=1)
-            assert flat.shape == (B, O * expected_feat_dim), \
-                f"global_cond shape wrong: got {flat.shape}, expect {(B, O * expected_feat_dim)}"
+            if args.debug:
+                assert flat.shape == (B, O * expected_feat_dim),  f"global_cond shape wrong: got {flat.shape}, expect {(B, O * expected_feat_dim)}"
         elif args.net == 'TransformerForDiffusion':
-            assert obs_features.shape == (B, O, expected_feat_dim), \
-                f"cond shape wrong for Transformer: got {obs_features.shape}"
+            if args.debug:
+                assert obs_features.shape == (B, O, expected_feat_dim), f"cond shape wrong for Transformer: got {obs_features.shape}"
 
         
         if args.net == 'ConditionalUnet1D':
@@ -525,7 +724,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # ema.step(nets.parameters())
         ema.step(ema_params)
         
-        if (args.debug or args.eval_official)  and ii >= 16:
+        if (args.debug and ii >= 128)  or (args.eval_official and ii >= 4 )  :
             break
     
     
@@ -541,22 +740,36 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             os.makedirs("./checkpoints/libero", exist_ok=True)
             ema.store(ema_params) 
             ema.copy_to(ema_params)
-            
-            torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
-                        'noise_pred_net': nets['noise_pred_net'].state_dict(),
-                        'epoch': epoch,
-                        'ema': ema.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        "args": vars(args)}, 
-                        f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
+
+            ckpt = {
+                'noise_pred_net': nets['noise_pred_net'].state_dict(),
+                'epoch': epoch,
+                'ema': ema.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                "args": vars(args),
+            }
+            if args.encoder_mode == "separate":
+                ckpt['vision_encoder'] = nets['vision_encoder'].state_dict()
+                ckpt['text_encoder'] = nets['text_encoder'].state_dict()
+            else:
+                ckpt['vlm_encoder'] = nets['vlm_encoder'].state_dict()
+
+            torch.save(ckpt, f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
             ema.restore(ema_params)
             
         if args.eval_official:
             nets.eval()
             state_dict = torch.load(args.eval_cp, map_location='cuda')
-            nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-            nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+            if args.encoder_mode == "separate":
+                nets['vision_encoder'].load_state_dict(state_dict['vision_encoder'])
+                if 'text_encoder' in state_dict:
+                    nets['text_encoder'].load_state_dict(state_dict['text_encoder'])
+            else:
+                if 'vlm_encoder' not in state_dict:
+                    raise KeyError("Checkpoint missing key 'vlm_encoder' for --encoder_mode vlm")
+                nets['vlm_encoder'].load_state_dict(state_dict['vlm_encoder'])
+            nets['noise_pred_net'].load_state_dict(state_dict['noise_pred_net'])
             print('load official checkpoint success')
         
 
@@ -686,56 +899,68 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         assert x_main_img.shape == (B, args.obs_horizon, 3, 256, 256) == x_wrist_image.shape
                         assert x_pos.shape == (B, args.obs_horizon, 8)
                         with torch.no_grad():
-                            
-                            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                            assert image_main_features_visencoder.shape == image_wrist_features_visencoder.shape 
-                            assert image_main_features_visencoder.shape == (B*args.obs_horizon, 512), f'assert shape error: {image_main_features_visencoder.shape}'
-                            
-                            main_feat  = image_main_features_visencoder.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
-                            wrist_feat = image_wrist_features_visencoder.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]                        
-                                            
-                            assert main_feat.shape == wrist_feat.shape == (B, args.obs_horizon, 512)
-                            
-                            if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
-                                x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
-                            else:
-                                x_pos_rep = x_pos  # 已经是 [B,O,8] 或 O=1                            
-                            assert x_pos_rep.shape == (B, args.obs_horizon, 8)
-                            
-                            # print('infer x_pos_rep:', x_pos_rep.shape) 
-                            text_enc = tokenizer(
-                                [task_description],
-                                padding="max_length",
-                                truncation=True,
-                                max_length=args.text_max_len,
-                                return_tensors="pt",
-                            )
-                            x_task_ids = text_enc["input_ids"].to(device, non_blocking=True)
-                            x_task_mask = text_enc["attention_mask"].to(device, non_blocking=True)
-                            if args.debug:
-                                assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
-                            text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
-                            last_hidden = text_out.last_hidden_state  # [1, L, D]
-                            if args.text_pool == "last":
-                                idx = x_task_mask.sum(dim=1) - 1
-                                idx = idx.clamp(min=0)
-                                text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
-                            else:
-                                mask = x_task_mask.unsqueeze(-1)
-                                text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                            text_feat = text_feat.to(dtype=torch.bfloat16)
-                            text_feat = text_feat.unsqueeze(1).expand(B, main_feat.shape[1], -1)  # [B, O, D]
-                            if args.debug:
-                                assert text_feat.shape[:2] == main_feat.shape[:2]
-                                assert text_feat.dtype == torch.bfloat16
+                            if args.encoder_mode == "separate":
+                                image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
+                                image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
+                                assert image_main_features_visencoder.shape == image_wrist_features_visencoder.shape
+                                assert image_main_features_visencoder.shape == (B*args.obs_horizon, 512), f'assert shape error: {image_main_features_visencoder.shape}'
 
-                            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
-                            # print('infer obs_features:', obs_features.shape) 
+                                main_feat  = image_main_features_visencoder.reshape(*x_main_img.shape[:2], -1)   # [B,O,D]
+                                wrist_feat = image_wrist_features_visencoder.reshape(*x_wrist_image.shape[:2], -1) # [B,O,D]
+                                assert main_feat.shape == wrist_feat.shape == (B, args.obs_horizon, 512)
+
+                                if x_pos.shape[1] == 1 and main_feat.shape[1] > 1:
+                                    x_pos_rep = x_pos.expand(-1, main_feat.shape[1], -1)
+                                else:
+                                    x_pos_rep = x_pos
+                                assert x_pos_rep.shape == (B, args.obs_horizon, 8)
+
+                                text_enc = tokenizer(
+                                    [task_description],
+                                    padding="max_length",
+                                    truncation=True,
+                                    max_length=args.text_max_len,
+                                    return_tensors="pt",
+                                )
+                                x_task_ids = text_enc["input_ids"].to(device, non_blocking=True)
+                                x_task_mask = text_enc["attention_mask"].to(device, non_blocking=True)
+                                if args.debug:
+                                    assert x_task_ids.dtype == torch.long and x_task_mask.dtype in (torch.long, torch.int64, torch.bool)
+                                text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+                                last_hidden = text_out.last_hidden_state  # [1, L, D]
+                                if args.text_pool == "last":
+                                    idx = x_task_mask.sum(dim=1) - 1
+                                    idx = idx.clamp(min=0)
+                                    text_feat = last_hidden[torch.arange(last_hidden.size(0), device=device), idx]
+                                else:
+                                    mask = x_task_mask.unsqueeze(-1)
+                                    text_feat = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                                text_feat = text_feat.to(dtype=torch.bfloat16)
+                                text_feat = text_feat.unsqueeze(1).expand(B, main_feat.shape[1], -1)  # [B, O, D]
+                                if args.debug:
+                                    assert text_feat.shape[:2] == main_feat.shape[:2]
+                                    assert text_feat.dtype == torch.bfloat16
+
+                                obs_features = torch.cat([main_feat, wrist_feat, x_pos_rep, text_feat], dim=-1)
+                                expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
+                            else:
+                                vlm_feat = encode_vlm_obs_features(
+                                    vlm_encoder=nets["vlm_encoder"],
+                                    vlm_processor=vlm_processor,
+                                    x_main_img=x_main_img,
+                                    x_wrist_image=x_wrist_image,
+                                    task_texts=[task_description],
+                                    normalize_images_01=args.normalize_images_01,
+                                    text_max_len=args.text_max_len,
+                                    device=device,
+                                )
+                                if x_pos.shape[1] == 1 and vlm_feat.shape[1] > 1:
+                                    x_pos_rep = x_pos.expand(-1, vlm_feat.shape[1], -1)
+                                else:
+                                    x_pos_rep = x_pos
+                                obs_features = torch.cat([vlm_feat, x_pos_rep], dim=-1)
+                                expected_feat_dim = vlm_feat.shape[-1] + x_pos_rep.shape[-1]
                         
-                        # expected dimension of per-timestep cond 
-                        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
-
                         B, O, D = obs_features.shape
                         # 1) check obs_features 
                         assert obs_features.shape == (B, O, expected_feat_dim), f"obs_features shape wrong: got {obs_features.shape}, expect {(B, O, expected_feat_dim)}"
@@ -827,6 +1052,5 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
  
             print('-'*20)    
-    if args.debug or args.eval_official:
-        break
+    
     

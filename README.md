@@ -15,6 +15,10 @@ Training and evaluation examples of using flow matching on Robomimic, PushT Libe
 - Install the Python dependencies: `pip install -r requirements.txt`
 
 - run train and evaluation on benchmark of 
-  * `pusht`: `CUDA_VISIBLE_DEVICES=0 python examples/flow_pusht.py  --net ConditionalUnet1D`
-  * `franka kitchen`: `CUDA_VISIBLE_DEVICES=0 python examples/flow_kitchen.py`
+  * `pusht`: `examples/flow_pusht.py`
+  * `franka kitchen`: `examples/flow_kitchen.py`
+  * `libero`: 
+    vision + robot state --> action:  `examples/flow_libero_unet.py` 
+    vision + textual instruction + robot state --> concat --> action:  `examples/flow_libero_unet_qwen.py` 
+    vision + textual instruction + robot state --> VLM --> action:  `examples/flow_libero_vlm.py` 
 
