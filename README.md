@@ -18,8 +18,8 @@ Training and evaluation examples of using flow matching on Robomimic, PushT, Lib
 - `pusht`: `examples/flow_pusht.py`
 - `franka kitchen`: `examples/flow_kitchen.py`
 - `libero`:
-  - **vision + robot state → action**: `examples/flow_libero_unet.py`
-  - **vision + textual instruction + robot state → concat → action**: `examples/flow_libero_unet_qwen.py`
-  - **vision + textual instruction + robot state → VLM → action**: `examples/flow_libero_vlm.py`
+  - **👁️ Vision + 🤖 Robot State → 🎯 Action**: `examples/flow_libero_unet.py`
+  - **👁️ Vision + 📝 Textual Instruction + 🤖 Robot State → 🎯 Action**: `examples/flow_libero_unet_qwen.py`
+  - **👁️ Vision + 📝 Textual Instruction + 🤖 Robot State → 🧠 VLM → 🎯 Action**: `examples/flow_libero_vlm.py`
 
 
