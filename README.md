@@ -9,16 +9,18 @@
 
 ## Key components
 🔬 **This repo contains** \
-Training and evaluation examples of using flow matching on Robomimic, PushT Libero and Franka Kitchen benchmarks. Modified from paper of `Affordance-based Robot Manipulation with Flow Matching`( https://hri-eu.github.io/flow-matching-policy/) with bugs fixed.
+Training and evaluation examples of using flow matching on Robomimic, PushT, Libero and Franka Kitchen benchmarks. Modified from paper of `Affordance-based Robot Manipulation with Flow Matching`( https://hri-eu.github.io/flow-matching-policy/) with bugs fixed and more features.
 
 🌷 **Getting Started**
-- Install the Python dependencies: `pip install -r requirements.txt`
+🚀 Install the Python dependencies: `pip install -r requirements.txt`
 
-- run train and evaluation on benchmark of 
+🧪 run train and evaluation on benchmark of 
   * `pusht`: `examples/flow_pusht.py`
   * `franka kitchen`: `examples/flow_kitchen.py`
   * `libero`: 
-    vision + robot state --> action:  `examples/flow_libero_unet.py` 
-    vision + textual instruction + robot state --> concat --> action:  `examples/flow_libero_unet_qwen.py` 
-    vision + textual instruction + robot state --> VLM --> action:  `examples/flow_libero_vlm.py` 
+    ** vision + robot state --> action:  `examples/flow_libero_unet.py` 
+
+    ** vision + textual instruction + robot state --> concat --> action:  `examples/flow_libero_unet_qwen.py` 
+
+    ** vision + textual instruction + robot state --> VLM --> action:  `examples/flow_libero_vlm.py` 
 
