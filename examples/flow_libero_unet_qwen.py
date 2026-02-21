@@ -232,18 +232,19 @@ device = 'cuda'
 parser = argparse.ArgumentParser()
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
 parser.add_argument("--frozen_vision", action="store_true")
-parser.add_argument("--debug", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
-parser.add_argument("--num_epochs", type=int, default=5000)
+parser.add_argument("--num_epochs", type=int, default=1000)
 parser.add_argument("--batchsize", type=int, default=128)
 parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
-parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
+parser.add_argument("--text_model", type=str, default="Qwen/Qwen2.5-0.5B")
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
+
+parser.add_argument("--debug", action="store_true")
 parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
 parser.add_argument( "--save_video", action='store_true')
@@ -554,6 +555,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             ema.copy_to(ema_params)
             
             torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
+                        'text_encoder': nets['text_encoder'].state_dict(),
                         'noise_pred_net': nets['noise_pred_net'].state_dict(),
                         'epoch': epoch,
                         'ema': ema.state_dict(),
@@ -567,6 +569,10 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             nets.eval()
             state_dict = torch.load(args.eval_cp, map_location='cuda')
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
+            if 'text_encoder' in state_dict:
+                nets.text_encoder.load_state_dict(state_dict['text_encoder'])
+            else:
+                print('warning: text_encoder not found in checkpoint, using current initialized weights')
             nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
             print('load official checkpoint success')
         
