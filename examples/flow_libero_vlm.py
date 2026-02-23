@@ -798,7 +798,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # ema.step(nets.parameters())
         ema.step(ema_params)
         
-        if (args.debug and ii >= 128)  or (args.eval_official and ii >= 4 )  :
+        if (args.debug and ii >= 8)  or (args.eval_official and ii >= 4 )  :
             break
     
     
