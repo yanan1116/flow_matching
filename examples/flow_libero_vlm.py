@@ -52,17 +52,21 @@ print = functools.partial(print, flush=True)
 
 # Avoid tokenizer parallelism warnings when DataLoader forks
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# Throughput-oriented defaults for CUDA kernels
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
 
 
-def _to_chw_float(img, normalize_01=True):
-    # img 可能已经是 torch.uint8 CHW（来自 with_transform）
+def _to_chw_tensor(img, normalize_01=True):
+    # img may already be torch.uint8 CHW (from HF with_transform)
     if torch.is_tensor(img):
         t = img
     else:
         t = pil_to_tensor(img.convert("RGB"))
-    t = t.float()
+    if t.dtype != torch.uint8:
+        t = t.to(torch.uint8)
     if normalize_01:
-        t = t / 255.0
+        t = t.float() / 255.0
     return t
 
 def hf_transform(ex):
@@ -159,9 +163,9 @@ class LiberoWindowedDataset(Dataset):
         actions = torch.from_numpy(self.actions[act_ids])              # (H,7)
         state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
 
-        images = torch.stack([_to_chw_float(self.base[i]["image"], normalize_01=self.normalize_images_01)
+        images = torch.stack([_to_chw_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
                             for i in obs_ids], dim=0)
-        wrist_images = torch.stack([_to_chw_float(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
+        wrist_images = torch.stack([_to_chw_tensor(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
                                     for i in obs_ids], dim=0)
         sample = {"actions": actions, "state": state0, "image": images, "wrist_image": wrist_images}
         ti = int(self.task_index_arr[obs_ids[0]])
@@ -182,15 +186,18 @@ def collate_with_task_text(batch):
     out["task_text"] = task_text
     return out
 
-def _chw_float_to_hwc_uint8_np(img_chw, normalize_01):
-    t = img_chw.detach().to("cpu")
-    if t.dtype == torch.bfloat16:
+def _batch_chw_to_hwc_uint8_np(imgs_bochw, normalize_01):
+    # Vectorized conversion to avoid per-image CPU sync/conversion overhead.
+    t = imgs_bochw.detach().to("cpu")
+    if (not normalize_01) and t.dtype == torch.uint8:
+        return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
+    if t.dtype in (torch.bfloat16, torch.float16):
         t = t.to(torch.float32)
     if normalize_01:
         t = (t.clamp(0, 1) * 255.0).round()
     else:
         t = t.clamp(0, 255)
-    return t.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+    return t.to(torch.uint8).permute(0, 1, 3, 4, 2).contiguous().numpy()
 
 def _extract_pooled_feature(model_out, attention_mask=None):
     if hasattr(model_out, "pooler_output") and model_out.pooler_output is not None:
@@ -316,14 +323,16 @@ def encode_vlm_obs_features(
     device,
 ):
     B, O = x_main_img.shape[:2]
+    main_imgs_hwc = _batch_chw_to_hwc_uint8_np(x_main_img, normalize_images_01)
+    wrist_imgs_hwc = _batch_chw_to_hwc_uint8_np(x_wrist_image, normalize_images_01)
     prompts = []
     image_pairs = []
     for b in range(B):
         prompt = task_texts[b]
         for o in range(O):
             prompts.append(prompt)
-            img_main = _chw_float_to_hwc_uint8_np(x_main_img[b, o], normalize_01=normalize_images_01)
-            img_wrist = _chw_float_to_hwc_uint8_np(x_wrist_image[b, o], normalize_01=normalize_images_01)
+            img_main = main_imgs_hwc[b, o]
+            img_wrist = wrist_imgs_hwc[b, o]
             image_pairs.append([img_main, img_wrist])
     texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs)
     vlm_inputs = _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len)
@@ -392,6 +401,8 @@ parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
 parser.add_argument("--num_epochs", type=int, default=1000)
 parser.add_argument("--batchsize", type=int, default=128)
+parser.add_argument("--num_workers", type=int, default=16)
+parser.add_argument("--prefetch_factor", type=int, default=4)
 parser.add_argument("--eval_interval", type=int, default=50)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
@@ -455,10 +466,18 @@ ds = LiberoWindowedDataset(base_ds,
                            normalize_images_01=args.normalize_images_01, 
                            task_map=task_map)
 
-dataloader = DataLoader(ds, batch_size=args.batchsize, shuffle=True, 
-                            num_workers=16, pin_memory=True,
-                            persistent_workers=True, prefetch_factor=4,
-                            collate_fn=collate_with_task_text)
+dataloader_kwargs = dict(
+    dataset=ds,
+    batch_size=args.batchsize,
+    shuffle=True,
+    num_workers=args.num_workers,
+    pin_memory=True,
+    persistent_workers=(args.num_workers > 0),
+    collate_fn=collate_with_task_text,
+)
+if args.num_workers > 0:
+    dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+dataloader = DataLoader(**dataloader_kwargs)
 
 batch = next(iter(dataloader))
 print(batch.keys())
@@ -570,6 +589,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         nets["vlm_encoder"].eval()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+    optimizer.zero_grad(set_to_none=True)
     for ii, batch in enumerate(pbar):
 
         if args.debug:
@@ -661,7 +681,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
         else:
             if args.frozen_vlm:
-                with torch.no_grad():
+                with torch.inference_mode():
                     vlm_feat = encode_vlm_obs_features(
                         vlm_encoder=nets["vlm_encoder"],
                         vlm_processor=vlm_processor,
@@ -712,12 +732,13 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             vt = nets['noise_pred_net'](xt, timestep, obs_features)
 
         loss = torch.mean((vt - ut) ** 2)
-        pbar.set_postfix(loss=float(loss.detach()))
+        if ii % 20 == 0:
+            pbar.set_postfix(loss=f"{loss.detach().item():.4f}")
         total_loss_train += loss.detach()
 
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         lr_scheduler.step()
 
         # update Exponential Moving Average of the model weights
