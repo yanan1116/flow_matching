@@ -69,6 +69,18 @@ def _to_chw_tensor(img, normalize_01=True):
         t = t.float() / 255.0
     return t
 
+def _to_hwc_uint8_tensor(img):
+    # Return CPU uint8 HWC tensor for VLM processor path.
+    if torch.is_tensor(img):
+        t = img
+        if t.dtype != torch.uint8:
+            t = t.to(torch.uint8)
+        if t.ndim == 3 and t.shape[0] == 3:
+            t = t.permute(1, 2, 0).contiguous()
+        return t
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    return torch.from_numpy(arr)
+
 def hf_transform(ex):
     # HF 可能传单条：ex["image"] 是 PIL
     # 也可能传 batch：ex["image"] 是 list[PIL]
@@ -95,12 +107,13 @@ class LiberoWindowedDataset(Dataset):
       actions:      (H, 7)  
     """
 
-    def __init__(self, base_ds, horizon=16, obs_horizon=1, normalize_images_01=True, task_map=None):
+    def __init__(self, base_ds, horizon=16, obs_horizon=1, normalize_images_01=True, task_map=None, vlm_mode=False):
         self.base = base_ds
         self.H = int(horizon)
         self.O = int(obs_horizon)
         assert self.H > 0 and self.O > 0
         self.normalize_images_01 = normalize_images_01
+        self.vlm_mode = bool(vlm_mode)
         
         # task_map: {task_index(int) -> natural language instruction(str)}
         self.task_map = task_map
@@ -163,10 +176,14 @@ class LiberoWindowedDataset(Dataset):
         actions = torch.from_numpy(self.actions[act_ids])              # (H,7)
         state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
 
-        images = torch.stack([_to_chw_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
-                            for i in obs_ids], dim=0)
-        wrist_images = torch.stack([_to_chw_tensor(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
-                                    for i in obs_ids], dim=0)
+        if self.vlm_mode:
+            images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["image"]) for i in obs_ids], dim=0)
+            wrist_images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["wrist_image"]) for i in obs_ids], dim=0)
+        else:
+            images = torch.stack([_to_chw_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
+                                for i in obs_ids], dim=0)
+            wrist_images = torch.stack([_to_chw_tensor(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
+                                        for i in obs_ids], dim=0)
         sample = {"actions": actions, "state": state0, "image": images, "wrist_image": wrist_images}
         ti = int(self.task_index_arr[obs_ids[0]])
         sample["task_text"] = self.task_map[ti]
@@ -186,10 +203,14 @@ def collate_with_task_text(batch):
     out["task_text"] = task_text
     return out
 
-def _batch_chw_to_hwc_uint8_np(imgs_bochw, normalize_01):
-    # Vectorized conversion to avoid per-image CPU sync/conversion overhead.
-    t = imgs_bochw.detach().to("cpu")
+def _batch_to_hwc_uint8_np(imgs, normalize_01):
+    # Accept [B,O,3,H,W] or [B,O,H,W,3] tensors and convert once.
+    t = imgs.detach().to("cpu")
+    if t.ndim != 5:
+        raise ValueError(f"Unexpected image batch shape: {tuple(t.shape)}")
     if (not normalize_01) and t.dtype == torch.uint8:
+        if t.shape[-1] == 3:
+            return t.contiguous().numpy()
         return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
     if t.dtype in (torch.bfloat16, torch.float16):
         t = t.to(torch.float32)
@@ -197,7 +218,10 @@ def _batch_chw_to_hwc_uint8_np(imgs_bochw, normalize_01):
         t = (t.clamp(0, 1) * 255.0).round()
     else:
         t = t.clamp(0, 255)
-    return t.to(torch.uint8).permute(0, 1, 3, 4, 2).contiguous().numpy()
+    t = t.to(torch.uint8)
+    if t.shape[-1] == 3:
+        return t.contiguous().numpy()
+    return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
 
 def _extract_pooled_feature(model_out, attention_mask=None):
     if hasattr(model_out, "pooler_output") and model_out.pooler_output is not None:
@@ -343,8 +367,8 @@ def encode_vlm_obs_features(
     prompt_cache=None,
 ):
     B, O = x_main_img.shape[:2]
-    main_imgs_hwc = _batch_chw_to_hwc_uint8_np(x_main_img, normalize_images_01)
-    wrist_imgs_hwc = _batch_chw_to_hwc_uint8_np(x_wrist_image, normalize_images_01)
+    main_imgs_hwc = _batch_to_hwc_uint8_np(x_main_img, normalize_images_01)
+    wrist_imgs_hwc = _batch_to_hwc_uint8_np(x_wrist_image, normalize_images_01)
     prompts = []
     image_pairs = []
     for b in range(B):
@@ -480,12 +504,14 @@ else:
     vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
     vlm_prompt_cache = {}
 
-base_ds = base_ds.with_transform(hf_transform)
+if args.encoder_mode == "separate":
+    base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
                            horizon=args.pred_horizon, 
                            obs_horizon=args.obs_horizon, 
                            normalize_images_01=args.normalize_images_01, 
-                           task_map=task_map)
+                           task_map=task_map,
+                           vlm_mode=(args.encoder_mode == "vlm"))
 
 dataloader_kwargs = dict(
     dataset=ds,
@@ -507,6 +533,7 @@ print('state:', batch["state"].shape)         # torch.Size([64, 1, 8])
 print('image:', batch["image"].shape)         # torch.Size([64, 1, 3, 256, 256])
 print('wrist_image:', batch["wrist_image"].shape)   # torch.Size([64, 1, 3, 256, 256])
 print('task_text:', len(batch['task_text']))
+print('image dtype:', batch["image"].dtype, 'wrist_image dtype:', batch["wrist_image"].dtype)
 assert isinstance(batch["task_text"], list)
 # for tt in batch['task_text']:
 #     print(tt)
