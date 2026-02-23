@@ -485,6 +485,7 @@ parser.add_argument("--frozen_vlm", action="store_true")
 parser.add_argument("--train_device", type=str, default="cuda:0")
 parser.add_argument("--vlm_device", type=str, default="cuda:0")
 parser.add_argument("--vlm_async_pipeline", action="store_true")
+parser.add_argument("--vlm_prefetch_depth", type=int, default=2)
 parser.add_argument("--eval_official", action='store_true')
 parser.add_argument("--save_image", action='store_true')
 parser.add_argument("--save_video", action='store_true')
@@ -657,6 +658,7 @@ pipeline_enabled = (
 )
 if pipeline_enabled:
     print(f"[pipeline] enabled: vlm_device={vlm_device} -> train_device={device}")
+    print(f"[pipeline] prefetch_depth={max(1, args.vlm_prefetch_depth)}")
 vlm_run_device = vlm_device if args.encoder_mode == "vlm" else device
 
         
@@ -682,12 +684,14 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     if pipeline_enabled:
         data_iter = iter(dataloader)
         async_executor = ThreadPoolExecutor(max_workers=1)
+        prefetch_q = collections.deque()
+        prefetch_depth = max(1, int(args.vlm_prefetch_depth))
 
         def _submit_next_feat():
             try:
                 b = next(data_iter)
             except StopIteration:
-                return None, None
+                return False
             fut = async_executor.submit(
                 _prepare_vlm_feat_async,
                 b,
@@ -699,20 +703,23 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                 device,
                 vlm_prompt_cache,
             )
-            return b, fut
+            prefetch_q.append((b, fut))
+            return True
 
-        batch, feat_future = _submit_next_feat()
+        for _ in range(prefetch_depth):
+            if not _submit_next_feat():
+                break
         ii = 0
-        iter_end = False
     else:
         batch_iter = enumerate(pbar)
 
     while True:
         if pipeline_enabled:
-            if batch is None or feat_future is None:
+            if not prefetch_q:
                 break
+            batch, feat_future = prefetch_q.popleft()
             vlm_feat_prefetched = feat_future.result()
-            next_batch, next_feat_future = _submit_next_feat()
+            _submit_next_feat()
         else:
             try:
                 ii, batch = next(batch_iter)
@@ -885,7 +892,6 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         if (args.debug and ii >= 128)  or (args.eval_official and ii >= 4 )  :
             break
         if pipeline_enabled:
-            batch, feat_future = next_batch, next_feat_future
             ii += 1
     if async_executor is not None:
         async_executor.shutdown(wait=False, cancel_futures=True)
