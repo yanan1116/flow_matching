@@ -48,7 +48,6 @@ num_steps_wait = 10
 video_out_path: str = "./saved_videos"
 
 import functools
-from concurrent.futures import ThreadPoolExecutor
 print = functools.partial(print, flush=True)
 
 # Avoid tokenizer parallelism warnings when DataLoader forks
@@ -391,31 +390,6 @@ def encode_vlm_obs_features(
     return pooled.view(B, O, -1)
 
 
-def _prepare_vlm_feat_async(
-    batch,
-    vlm_encoder,
-    vlm_processor,
-    normalize_images_01,
-    text_max_len,
-    vlm_device,
-    train_device,
-    prompt_cache,
-):
-    with torch.inference_mode():
-        vlm_feat = encode_vlm_obs_features(
-            vlm_encoder=vlm_encoder,
-            vlm_processor=vlm_processor,
-            x_main_img=batch["image"],
-            x_wrist_image=batch["wrist_image"],
-            task_texts=batch["task_text"],
-            normalize_images_01=normalize_images_01,
-            text_max_len=text_max_len,
-            device=vlm_device,
-            prompt_cache=prompt_cache,
-        )
-    return vlm_feat.to(device=train_device, non_blocking=True)
-
-
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
@@ -462,6 +436,7 @@ def get_state(obs):
     return state
 
 assert torch.cuda.is_available()
+device = 'cuda'
 parser = argparse.ArgumentParser()
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
 # parser.add_argument("--frozen_vision", action="store_true")
@@ -482,10 +457,6 @@ parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
 parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
 parser.add_argument("--frozen_vlm", action="store_true")
-parser.add_argument("--train_device", type=str, default="cuda:0")
-parser.add_argument("--vlm_device", type=str, default="cuda:0")
-parser.add_argument("--vlm_async_pipeline", action="store_true")
-parser.add_argument("--vlm_prefetch_depth", type=int, default=2)
 parser.add_argument("--eval_official", action='store_true')
 parser.add_argument("--save_image", action='store_true')
 parser.add_argument("--save_video", action='store_true')
@@ -494,8 +465,6 @@ parser.add_argument("--eval_cp", type=str, default="./checkpoints/libero/cp-Cond
 parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
 print('args:', args)
-device = args.train_device
-vlm_device = args.vlm_device
  
 ##################################
 hf_dataset_repo = "physical-intelligence/libero"
@@ -602,7 +571,7 @@ if args.encoder_mode == "separate":
     modules["text_encoder"] = text_encoder
 else:
     vlm_encoder_model = _load_vlm_encoder(args.vlm_model, dtype=torch.bfloat16)
-    vlm_encoder_model = vlm_encoder_model.to(vlm_device, dtype=torch.bfloat16)
+    vlm_encoder_model = vlm_encoder_model.to(device, dtype=torch.bfloat16)
     vlm_embed_dim = _get_vlm_hidden_size(vlm_encoder_model)
     per_timestep_cond_dim = vlm_embed_dim + 8
 
@@ -650,16 +619,6 @@ lr_scheduler = get_scheduler(
 
 FM = ConditionalFlowMatcher(sigma=sigma)
 print('model initialized')
-pipeline_enabled = (
-    args.encoder_mode == "vlm"
-    and args.frozen_vlm
-    and args.vlm_async_pipeline
-    and (vlm_device != device)
-)
-if pipeline_enabled:
-    print(f"[pipeline] enabled: vlm_device={vlm_device} -> train_device={device}")
-    print(f"[pipeline] prefetch_depth={max(1, args.vlm_prefetch_depth)}")
-vlm_run_device = vlm_device if args.encoder_mode == "vlm" else device
 
         
 ########################################################################
@@ -680,52 +639,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
     optimizer.zero_grad(set_to_none=True)
-    async_executor = None
-    if pipeline_enabled:
-        data_iter = iter(dataloader)
-        async_executor = ThreadPoolExecutor(max_workers=1)
-        prefetch_q = collections.deque()
-        prefetch_depth = max(1, int(args.vlm_prefetch_depth))
-
-        def _submit_next_feat():
-            try:
-                b = next(data_iter)
-            except StopIteration:
-                return False
-            fut = async_executor.submit(
-                _prepare_vlm_feat_async,
-                b,
-                vlm_encoder_model,
-                vlm_processor,
-                args.normalize_images_01,
-                args.text_max_len,
-                vlm_device,
-                device,
-                vlm_prompt_cache,
-            )
-            prefetch_q.append((b, fut))
-            return True
-
-        for _ in range(prefetch_depth):
-            if not _submit_next_feat():
-                break
-        ii = 0
-    else:
-        batch_iter = enumerate(pbar)
-
-    while True:
-        if pipeline_enabled:
-            if not prefetch_q:
-                break
-            batch, feat_future = prefetch_q.popleft()
-            vlm_feat_prefetched = feat_future.result()
-            _submit_next_feat()
-        else:
-            try:
-                ii, batch = next(batch_iter)
-            except StopIteration:
-                break
-            vlm_feat_prefetched = None
+    for ii, batch in enumerate(pbar):
 
         if args.debug:
             batch_wrist_image_min, batch_wrist_image_max = batch['wrist_image'].min().item(), batch['wrist_image'].max().item()
@@ -753,8 +667,6 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             x_wrist_image = x_wrist_image.to(device, non_blocking=True).to(dtype=torch.bfloat16)
             x_task_ids = torch.stack([task_text_inputs[t][0] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
             x_task_mask = torch.stack([task_text_inputs[t][1] for t in batch["task_text"]], dim=0).to(device, non_blocking=True)
-        elif pipeline_enabled:
-            vlm_feat = vlm_feat_prefetched.to(dtype=torch.bfloat16)
 
         if args.debug:
             if args.encoder_mode == "separate":
@@ -817,9 +729,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             obs_features = torch.cat([main_feat, wrist_feat, x_pos_rep, text_feat], dim=-1)
             expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
         else:
-            if pipeline_enabled:
-                pass
-            elif args.frozen_vlm:
+            if args.frozen_vlm:
                 with torch.inference_mode():
                     vlm_feat = encode_vlm_obs_features(
                         vlm_encoder=vlm_encoder_model,
@@ -829,7 +739,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         task_texts=batch["task_text"],
                         normalize_images_01=args.normalize_images_01,
                         text_max_len=args.text_max_len,
-                        device=vlm_run_device,
+                        device=device,
                         prompt_cache=vlm_prompt_cache,
                     )
             else:
@@ -841,7 +751,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                     task_texts=batch["task_text"],
                     normalize_images_01=args.normalize_images_01,
                     text_max_len=args.text_max_len,
-                    device=vlm_run_device,
+                    device=device,
                     prompt_cache=vlm_prompt_cache,
                 )
             if vlm_feat.device != x_pos.device:
@@ -887,14 +797,9 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # update Exponential Moving Average of the model weights
         # ema.step(nets.parameters())
         ema.step(ema_params)
-        pbar.update(1 if pipeline_enabled else 0)
         
         if (args.debug and ii >= 128)  or (args.eval_official and ii >= 4 )  :
             break
-        if pipeline_enabled:
-            ii += 1
-    if async_executor is not None:
-        async_executor.shutdown(wait=False, cancel_futures=True)
     
     
     
@@ -1121,7 +1026,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                                     task_texts=[task_description],
                                     normalize_images_01=args.normalize_images_01,
                                     text_max_len=args.text_max_len,
-                                    device=vlm_run_device,
+                                    device=device,
                                     prompt_cache=vlm_prompt_cache,
                                 )
                                 if vlm_feat.device != x_pos.device:
