@@ -480,7 +480,7 @@ parser.add_argument("--encoder_mode", type=str, default="separate", choices=["se
 parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
-parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen3-VL-4B-Thinking")
+parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
 parser.add_argument("--frozen_vlm", action="store_true")
 parser.add_argument("--train_device", type=str, default="cuda:0")
 parser.add_argument("--vlm_device", type=str, default="cuda:0")
