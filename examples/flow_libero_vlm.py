@@ -230,23 +230,28 @@ def _extract_pooled_feature(model_out, attention_mask=None):
 
     raise RuntimeError("Cannot extract pooled feature from VLM output.")
 
-def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs):
+def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=None):
     # image_pairs: List[List[np.ndarray(H, W, 3), np.ndarray(H, W, 3)]]
     use_chat_template = hasattr(vlm_processor, "apply_chat_template")
     if use_chat_template:
         texts = []
         for p in prompts:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "image"},
-                        {"type": "text", "text": p},
-                    ],
-                }
-            ]
-            txt = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            if prompt_cache is not None and p in prompt_cache:
+                txt = prompt_cache[p]
+            else:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "image"},
+                            {"type": "text", "text": p},
+                        ],
+                    }
+                ]
+                txt = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                if prompt_cache is not None:
+                    prompt_cache[p] = txt
             texts.append(txt)
     else:
         texts = prompts
@@ -286,31 +291,45 @@ def _get_vlm_hidden_size(vlm_encoder):
             return int(sub_cfg.hidden_size)
     raise RuntimeError("Cannot infer hidden size from VLM config.")
 
-def _load_vlm_encoder(model_name, dtype):
+def _from_pretrained_with_loading_info(model_cls, model_name, dtype):
+    # transformers has migrated from torch_dtype -> dtype on newer versions.
+    common = dict(trust_remote_code=True, output_loading_info=True)
     try:
-        return AutoModel.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        )
-    except Exception as e_auto:
-        auto_v2s = getattr(transformers, "AutoModelForVision2Seq", None)
-        if auto_v2s is not None:
-            try:
-                return auto_v2s.from_pretrained(
-                    model_name,
-                    torch_dtype=dtype,
-                    trust_remote_code=True,
+        return model_cls.from_pretrained(model_name, dtype=dtype, **common)
+    except TypeError:
+        return model_cls.from_pretrained(model_name, torch_dtype=dtype, **common)
+
+def _load_vlm_encoder(model_name, dtype):
+    # Prefer generation-capable VLM classes first for Qwen VL checkpoints.
+    candidates = [
+        getattr(transformers, "AutoModelForImageTextToText", None),
+        getattr(transformers, "AutoModelForVision2Seq", None),
+        AutoModel,
+    ]
+    last_err = None
+    for cls in candidates:
+        if cls is None:
+            continue
+        try:
+            model, loading_info = _from_pretrained_with_loading_info(cls, model_name, dtype)
+            missing = loading_info.get("missing_keys", []) if isinstance(loading_info, dict) else []
+            if len(missing) > 128:
+                raise RuntimeError(
+                    f"VLM checkpoint appears partially initialized with {len(missing)} missing keys. "
+                    "This usually means an incompatible model class/version was used."
                 )
-            except Exception:
-                pass
-        ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
-        if "Qwen3-VL" in model_name and ver < (4, 50):
-            raise RuntimeError(
-                f"{model_name} may require newer transformers than {transformers.__version__}. "
-                f"Please upgrade transformers or use an older VLM checkpoint."
-            ) from e_auto
-        raise
+            return model
+        except Exception as e:
+            last_err = e
+            continue
+
+    ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+    if "Qwen3-VL" in model_name and ver < (4, 50):
+        raise RuntimeError(
+            f"{model_name} may require newer transformers than {transformers.__version__}. "
+            f"Please upgrade transformers or use an older VLM checkpoint."
+        ) from last_err
+    raise RuntimeError(f"Failed to load VLM encoder for {model_name}: {last_err}")
 
 def encode_vlm_obs_features(
     vlm_encoder,
@@ -321,6 +340,7 @@ def encode_vlm_obs_features(
     normalize_images_01,
     text_max_len,
     device,
+    prompt_cache=None,
 ):
     B, O = x_main_img.shape[:2]
     main_imgs_hwc = _batch_chw_to_hwc_uint8_np(x_main_img, normalize_images_01)
@@ -334,7 +354,7 @@ def encode_vlm_obs_features(
             img_main = main_imgs_hwc[b, o]
             img_wrist = wrist_imgs_hwc[b, o]
             image_pairs.append([img_main, img_wrist])
-    texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs)
+    texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=prompt_cache)
     vlm_inputs = _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len)
     for k, v in list(vlm_inputs.items()):
         if torch.is_tensor(v):
@@ -458,6 +478,7 @@ else:
     tokenizer = None
     task_text_inputs = None
     vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
+    vlm_prompt_cache = {}
 
 base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
@@ -691,6 +712,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         normalize_images_01=args.normalize_images_01,
                         text_max_len=args.text_max_len,
                         device=device,
+                        prompt_cache=vlm_prompt_cache,
                     )
             else:
                 vlm_feat = encode_vlm_obs_features(
@@ -702,6 +724,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                     normalize_images_01=args.normalize_images_01,
                     text_max_len=args.text_max_len,
                     device=device,
+                    prompt_cache=vlm_prompt_cache,
                 )
             if x_pos.shape[1] == 1 and vlm_feat.shape[1] > 1:
                 x_pos_rep = x_pos.expand(-1, vlm_feat.shape[1], -1)
@@ -974,6 +997,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                                     normalize_images_01=args.normalize_images_01,
                                     text_max_len=args.text_max_len,
                                     device=device,
+                                    prompt_cache=vlm_prompt_cache,
                                 )
                                 if x_pos.shape[1] == 1 and vlm_feat.shape[1] > 1:
                                     x_pos_rep = x_pos.expand(-1, vlm_feat.shape[1], -1)
