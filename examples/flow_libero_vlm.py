@@ -73,17 +73,23 @@ def _to_chw_tensor(img, normalize_01=True):
         t = t.float() / 255.0
     return t
 
-def _to_hwc_uint8_tensor(img):
-    # Return CPU uint8 HWC tensor for VLM processor path.
+def _to_hwc_tensor(img, normalize_01=True):
+    # Return CPU HWC tensor for VLM processor path.
+    # normalize_01=True -> float in [0,1]; False -> uint8 in [0,255].
     if torch.is_tensor(img):
         t = img
-        if t.dtype != torch.uint8:
-            t = t.to(torch.uint8)
         if t.ndim == 3 and t.shape[0] == 3:
             t = t.permute(1, 2, 0).contiguous()
-        return t
-    arr = np.array(img.convert("RGB"), dtype=np.uint8, copy=True)
-    return torch.from_numpy(arr)
+    else:
+        arr = np.array(img.convert("RGB"), dtype=np.uint8, copy=True)
+        t = torch.from_numpy(arr)
+    if normalize_01:
+        if t.dtype == torch.uint8:
+            return t.float() / 255.0
+        return t.to(torch.float32).clamp(0, 1)
+    if t.dtype != torch.uint8:
+        t = t.clamp(0, 255).to(torch.uint8)
+    return t
 
 def hf_transform(ex):
     # HF 可能传单条：ex["image"] 是 PIL
@@ -181,8 +187,10 @@ class LiberoWindowedDataset(Dataset):
         state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
 
         if self.vlm_mode:
-            images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["image"]) for i in obs_ids], dim=0)
-            wrist_images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["wrist_image"]) for i in obs_ids], dim=0)
+            images = torch.stack([_to_hwc_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
+                                  for i in obs_ids], dim=0)
+            wrist_images = torch.stack([_to_hwc_tensor(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
+                                        for i in obs_ids], dim=0)
         else:
             images = torch.stack([_to_chw_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
                                 for i in obs_ids], dim=0)
@@ -212,7 +220,8 @@ def _batch_to_hwc_uint8_np(imgs, normalize_01):
     t = imgs.detach().to("cpu")
     if t.ndim != 5:
         raise ValueError(f"Unexpected image batch shape: {tuple(t.shape)}")
-    if (not normalize_01) and t.dtype == torch.uint8:
+    # If already uint8, treat as [0,255] regardless of normalize_01 flag.
+    if t.dtype == torch.uint8:
         if t.shape[-1] == 3:
             return t.contiguous().numpy()
         return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
