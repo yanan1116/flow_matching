@@ -1,9 +1,13 @@
 #!/usr/bin/env python
-import sys,random,time
+import sys,random,time,os
 sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
-import os
+
+LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
+if LIBERO_ROOT not in sys.path:
+    sys.path.append(LIBERO_ROOT)
+       
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
