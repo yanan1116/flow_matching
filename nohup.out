@@ -1,0 +1,11 @@
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[robosuite WARNING] No private macro file found! (__init__.py:7)
+[robosuite WARNING] It is recommended to use a private macro file (__init__.py:8)
+[robosuite WARNING] To setup, run: python /home/yanan/anaconda3/envs/flow_matching_libero_transfomers_u/lib/python3.10/site-packages/robosuite/scripts/setup_macros.py (__init__.py:9)
+pygame 2.6.1 (SDL 2.28.4, Python 3.10.19)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+bddl files path: /home/yanan/robotics/LIBERO-plus/libero/libero/bddl_files
+args: Namespace(net='ConditionalUnet1D', debug=False, normalize_images_01=False, n_test=50, num_epochs=1000, batchsize=512, num_workers=16, prefetch_factor=4, save_interval=50, obs_horizon=1, action_horizon=8, pred_horizon=16, encoder_mode='separate', text_model='Qwen/Qwen3-0.6B', vlm_model='Qwen/Qwen2-VL-2B-Instruct', frozen_text_model=True, text_max_len=64, text_pool='last', frozen_vlm=False, eval=False, save_image=False, save_video=False, eval_cp=None, cp_name='frozen_text_model_nonorm', video_name='')

@@ -3,6 +3,12 @@ import sys,random,time
 sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
+
+LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
+if LIBERO_ROOT not in sys.path:
+    sys.path.append(LIBERO_ROOT)
+    
+    
 import os
 import matplotlib.pyplot as plt
 import numpy as np
@@ -231,7 +237,7 @@ assert torch.cuda.is_available()
 device = 'cuda'
 parser = argparse.ArgumentParser()
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
-parser.add_argument("--frozen_vision", action="store_true")
+# parser.add_argument("--frozen_vision", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
 parser.add_argument("--num_epochs", type=int, default=1000)
@@ -240,10 +246,10 @@ parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
-parser.add_argument("--text_model", type=str, default="Qwen/Qwen2.5-0.5B")
+parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
+parser.add_argument("--frozen_text_model", action='store_true')
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
-
 parser.add_argument("--debug", action="store_true")
 parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
@@ -365,9 +371,10 @@ nets = nn.ModuleDict({
     'noise_pred_net': noise_pred_net
 }).to(device, dtype=torch.bfloat16)
     
-if args.frozen_vision:
-    nets['vision_encoder'].eval()  # important: disable GN/Dropout behavior changes
-    for p in nets['vision_encoder'].parameters():
+
+if args.frozen_text_model:
+    nets['text_encoder'].eval()
+    for p in nets['text_encoder'].parameters():
         p.requires_grad = False
         
 ##################################################################
@@ -402,8 +409,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     
     nets.train()
     
-    if args.frozen_vision:
-        nets['vision_encoder'].eval()
+    if args.frozen_text_model:
+        nets['text_encoder'].eval()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
     for ii, batch in enumerate(pbar):
@@ -459,13 +466,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         ut = ut.to(dtype=torch.bfloat16)
 
         # encoder vision features
-        if args.frozen_vision:
-            with torch.no_grad():
-                image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-                image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
-        else:
-            image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
-            image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
+        image_main_features_visencoder = nets['vision_encoder'](x_main_img.flatten(end_dim=1).to(dtype=torch.bfloat16))
+        image_wrist_features_visencoder = nets['vision_encoder'](x_wrist_image.flatten(end_dim=1).to(dtype=torch.bfloat16))
 
         # print(x_main_img.shape, x_main_img.flatten(end_dim=1).shape, image_main_features_visencoder.shape)
         # print('train image_main_features_visencoder:', image_main_features_visencoder.shape)
@@ -485,7 +487,11 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         if args.debug:
             assert x_pos_rep.shape[:2] == main_feat.shape[:2]
 
-        text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+        if args.frozen_text_model:
+            with torch.inference_mode():
+                text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+        else:
+            text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
         last_hidden = text_out.last_hidden_state  # [B, L, D]
         if args.text_pool == "last":
             idx = x_task_mask.sum(dim=1) - 1

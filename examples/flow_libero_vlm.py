@@ -451,7 +451,6 @@ assert torch.cuda.is_available()
 device = 'cuda'
 parser = argparse.ArgumentParser()
 parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["TransformerForDiffusion", "ConditionalUnet1D"])
-# parser.add_argument("--frozen_vision", action="store_true")
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
@@ -459,20 +458,22 @@ parser.add_argument("--num_epochs", type=int, default=1000)
 parser.add_argument("--batchsize", type=int, default=128)
 parser.add_argument("--num_workers", type=int, default=16)
 parser.add_argument("--prefetch_factor", type=int, default=4)
-parser.add_argument("--save_interval", type=int, default=50)
+parser.add_argument("--save_interval", type=int, default=50) ###
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
-parser.add_argument("--encoder_mode", type=str, default="separate", choices=["separate", "vlm"])
+parser.add_argument("--encoder_mode", type=str, default="separate", choices=["separate", "vlm"]) ###
 parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
+parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
+parser.add_argument("--frozen_text_model", action='store_true') ## 
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
-parser.add_argument("--vlm_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
-parser.add_argument("--frozen_vlm", action="store_true")
+parser.add_argument("--frozen_vlm", action="store_true") ###
 parser.add_argument("--eval", action='store_true')
 parser.add_argument("--save_image", action='store_true')
 parser.add_argument("--save_video", action='store_true')
 parser.add_argument("--eval_cp", type=str, default=None)
+parser.add_argument("--cp_name", type=str, default='')
 parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
 print('args:', args)
@@ -608,6 +609,11 @@ else:
 
 nets = nn.ModuleDict({**modules, 'noise_pred_net': noise_pred_net}).to(device, dtype=torch.bfloat16)
 
+if args.encoder_mode == "separate" and args.frozen_text_model:
+    nets["text_encoder"].eval()
+    for p in nets["text_encoder"].parameters():
+        p.requires_grad = False
+
 if args.encoder_mode == "vlm" and args.frozen_vlm:
     vlm_encoder_model.eval()
     for p in vlm_encoder_model.parameters():
@@ -640,6 +646,8 @@ if not args.eval:
         
         nets.train()
 
+        if args.encoder_mode == "separate" and args.frozen_text_model:
+            nets["text_encoder"].eval()
         if args.encoder_mode == "vlm" and args.frozen_vlm:
             vlm_encoder_model.eval()
         
@@ -717,7 +725,11 @@ if not args.eval:
                 if args.debug:
                     assert x_pos_rep.shape[:2] == main_feat.shape[:2]
 
-                text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+                if args.frozen_text_model:
+                    with torch.inference_mode():
+                        text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
+                else:
+                    text_out = nets['text_encoder'](input_ids=x_task_ids, attention_mask=x_task_mask)
                 last_hidden = text_out.last_hidden_state  # [B, L, D]
                 if args.text_pool == "last":
                     idx = x_task_mask.sum(dim=1) - 1
@@ -812,7 +824,7 @@ if not args.eval:
             
         
         # save checkpoint
-        if (epoch % args.save_interval == 0 and epoch > 0) or args.debug :
+        if (epoch+1) % args.save_interval  == 0  or args.debug :
             cp_save_path = "./checkpoints/libero/vlm/"
             os.makedirs(cp_save_path, exist_ok=True)
             ema.store(ema_params) 
@@ -835,7 +847,7 @@ if not args.eval:
             else:
                 ckpt['vlm_encoder'] = vlm_encoder_model.state_dict()
 
-            torch.save(ckpt, f'{cp_save_path}/cp-{args.net}-{args.encoder_mode}-{epoch}.pth')
+            torch.save(ckpt, f'{cp_save_path}/cp-{args.net}-{args.encoder_mode}-{args.cp_name}-{epoch}.pth')
             ema.restore(ema_params)    
 
         if args.debug:
