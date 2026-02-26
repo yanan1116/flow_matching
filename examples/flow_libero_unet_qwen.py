@@ -249,7 +249,7 @@ parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
 parser.add_argument( "--save_video", action='store_true')
 parser.add_argument( "--save_cp", action='store_true')
-parser.add_argument("--eval_cp", type=str, default="./checkpoints/libero/cp-ConditionalUnet1D-400.pth")
+parser.add_argument("--eval_cp", type=str, default=None)
 parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
 print('args:', args)
@@ -318,7 +318,12 @@ if args.save_image:
     idxs = random.sample(range(B), min(N, B))
     for i, idx in enumerate(idxs):
         img = imgs[idx, 0]
-        img = img.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        img = img.permute(1, 2, 0).cpu().numpy()
+        if args.normalize_images_01:
+            img = np.clip(img, 0.0, 1.0) * 255.0
+        else:
+            img = np.clip(img, 0.0, 255.0)
+        img = img.astype(np.uint8)
         Image.fromarray(img).save(f"saved_images/libero_hf_image_{i}.png")
 # images are in normal orientation
 
@@ -550,7 +555,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
 
         if args.save_cp:
-            os.makedirs("./checkpoints/libero", exist_ok=True)
+            cp_save_path = "./checkpoints/libero/unet_qwen/"
+            os.makedirs(cp_save_path, exist_ok=True)
             ema.store(ema_params) 
             ema.copy_to(ema_params)
             
@@ -562,10 +568,11 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         "args": vars(args)}, 
-                        f'./checkpoints/libero/cp-{args.net}-{epoch}.pth')
+                        f'{cp_save_path}/cp-{args.net}-{epoch}.pth')
             ema.restore(ema_params)
             
         if args.eval_official:
+            assert args.eval_cp is not None
             nets.eval()
             state_dict = torch.load(args.eval_cp, map_location='cuda')
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
@@ -690,8 +697,11 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         # print('infer x_pos:', x_pos.shape)
                         
                         if args.normalize_images_01:
-                            x_main_img /= 255.0  
-                            x_wrist_image /= 255.0 
+                            x_main_img = x_main_img.astype(np.float32) / 255.0
+                            x_wrist_image = x_wrist_image.astype(np.float32) / 255.0
+                            if args.debug:
+                                assert x_main_img.min() >= 0.0 and x_main_img.max() <= 1.0, "eval x_main_img range error after normalize"
+                                assert x_wrist_image.min() >= 0.0 and x_wrist_image.max() <= 1.0, "eval x_wrist_image range error after normalize"
                                              
                         x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.bfloat16)
                         x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.bfloat16)
