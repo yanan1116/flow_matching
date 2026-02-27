@@ -90,5 +90,14 @@ def main():
     base_ds.save_to_disk(args.output_dir) 
     
     
+    
+    base_ds.push_to_hub( 'yananchen/molmoact_libero_map_sample',
+        tags=["libero", "panda", "franka"],
+        private=False,
+        push_videos=True,
+        license="apache-2.0",
+    )
+    
+    
 if __name__ == "__main__":
     main()
