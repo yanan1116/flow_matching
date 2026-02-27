@@ -44,8 +44,8 @@ def extract_action_chunk(example):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", type=str, default='/mnt/disk1t/molmoact_libero')
-    parser.add_argument("--output_dir", type=str, default="/mnt/disk1t/molmoact_libero_map")
+    parser.add_argument("--cache_dir", type=str, default='')
+    parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--shuffle", action='store_true')
     parser.add_argument("--subsample_per_subset", type=int, default=0)
     return parser.parse_args()
@@ -61,7 +61,7 @@ def main():
             "allenai/libero",
             subset_name,
             split='train',
-            cache_dir=args.cache_dir,
+            #cache_dir=args.cache_dir,
         )
         if args.shuffle:
             ds_part = ds_part.shuffle()
@@ -83,11 +83,12 @@ def main():
     print("instruction dtype:", base_ds.features["instruction"])
     print("example action_chunk:", base_ds[0]["action_chunk"])
     print("example instruction:", base_ds[0]["instruction"])
-    print("saved to:", args.output_dir)
-    out_dir = Path(args.output_dir)
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    base_ds.save_to_disk(args.output_dir) 
+    
+    # print("saved to:", args.output_dir)
+    # out_dir = Path(args.output_dir)
+    # if out_dir.exists():
+    #     shutil.rmtree(out_dir)
+    # base_ds.save_to_disk(args.output_dir) 
     
     
     
