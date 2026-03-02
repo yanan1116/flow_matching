@@ -863,8 +863,9 @@ else:
     state_dict = torch.load(args.eval_cp, map_location='cuda')
     if args.encoder_mode == "separate":
         nets['vision_encoder'].load_state_dict(state_dict['vision_encoder'])
-        if 'text_encoder' in state_dict:
-            nets['text_encoder'].load_state_dict(state_dict['text_encoder'])
+        if 'text_encoder' not in state_dict:
+            raise KeyError("Checkpoint missing key 'text_encoder' for --encoder_mode separate")
+        nets['text_encoder'].load_state_dict(state_dict['text_encoder'])
     else:
         if 'vlm_encoder' not in state_dict:
             raise KeyError("Checkpoint missing key 'vlm_encoder' for --encoder_mode vlm")
@@ -988,8 +989,8 @@ else:
                     # print('infer x_pos:', x_pos.shape)
                     
                     if args.normalize_images_01:
-                        x_main_img /= 255.0  
-                        x_wrist_image /= 255.0 
+                        x_main_img = x_main_img.astype(np.float32) / 255.0
+                        x_wrist_image = x_wrist_image.astype(np.float32) / 255.0
                                             
                     x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.bfloat16)
                     x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.bfloat16)
