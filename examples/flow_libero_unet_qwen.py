@@ -242,7 +242,7 @@ parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
 parser.add_argument("--num_epochs", type=int, default=1000)
 parser.add_argument("--batchsize", type=int, default=128)
-parser.add_argument("--eval_interval", type=int, default=100)
+# parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
@@ -557,7 +557,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         
     
     # do evaluation below - inference
-    if (epoch % args.eval_interval == 0 and epoch > 0) or args.debug or args.eval_official:
+    if (epoch in [50, 100, 150, 200, 300, 400, 500, 600, 800, 1000]) or args.debug or args.eval_official:
 
         if args.save_cp:
             cp_save_path = "./checkpoints/libero/unet_qwen/"
