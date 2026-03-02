@@ -40,7 +40,7 @@ import transformers
 from transformers import AutoProcessor
 # from utils import *
 from datasets import load_dataset
-
+from transformers import AutoTokenizer, AutoModel
 from libero.libero import benchmark
 import pathlib,math,random,imageio,collections,os,sys
 from libero.libero import get_libero_path
