@@ -31,6 +31,13 @@ from torchcfm.utils import *
 from torchcfm.models.models import *
 import pygame,h5py,argparse
 from unet import ConditionalUnet1D
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
 from transformers import AutoTokenizer, AutoModel
 # from utils import *
 from datasets import load_dataset
@@ -248,6 +255,9 @@ parser.add_argument("--action_horizon", type=int, default=8)
 parser.add_argument("--pred_horizon", type=int, default=16)
 parser.add_argument("--text_model", type=str, default="Qwen/Qwen3-0.6B")
 parser.add_argument("--frozen_text_model", action='store_true')
+parser.add_argument("--text_lora_r", type=int, default=16)
+parser.add_argument("--text_lora_alpha", type=int, default=32)
+parser.add_argument("--text_lora_dropout", type=float, default=0)
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
 parser.add_argument("--debug", action="store_true")
@@ -344,6 +354,15 @@ text_encoder = AutoModel.from_pretrained(
     args.text_model,
     torch_dtype=torch.bfloat16,
 )
+text_lora_config = LoraConfig(
+    task_type=TaskType.FEATURE_EXTRACTION,
+    inference_mode=False,
+    r=args.text_lora_r,
+    lora_alpha=args.text_lora_alpha,
+    lora_dropout=args.text_lora_dropout,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+)
+text_encoder = get_peft_model(text_encoder, text_lora_config)
 text_embed_dim = int(text_encoder.config.hidden_size)
 per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
 if args.net == "ConditionalUnet1D":
@@ -377,6 +396,8 @@ if args.frozen_text_model:
     nets['text_encoder'].eval()
     for p in nets['text_encoder'].parameters():
         p.requires_grad = False
+elif hasattr(nets['text_encoder'], "print_trainable_parameters"):
+    nets['text_encoder'].print_trainable_parameters()
         
 ##################################################################
 sigma = 0.0
@@ -567,7 +588,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             ema.copy_to(ema_params)
             
             torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
-                        'text_encoder': nets['text_encoder'].state_dict(),
+                        'text_encoder_lora': get_peft_model_state_dict(nets['text_encoder']),
                         'noise_pred_net': nets['noise_pred_net'].state_dict(),
                         'epoch': epoch,
                         'ema': ema.state_dict(),
@@ -582,7 +603,9 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             nets.eval()
             state_dict = torch.load(args.eval_cp, map_location='cuda')
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-            if 'text_encoder' in state_dict:
+            if 'text_encoder_lora' in state_dict:
+                set_peft_model_state_dict(nets['text_encoder'], state_dict['text_encoder_lora'])
+            elif 'text_encoder' in state_dict:
                 nets.text_encoder.load_state_dict(state_dict['text_encoder'])
             else:
                 print('warning: text_encoder not found in checkpoint, using current initialized weights')
