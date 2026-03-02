@@ -261,7 +261,6 @@ parser.add_argument("--text_lora_dropout", type=float, default=0)
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--text_pool", type=str, default="last", choices=["last", "mean"])
 parser.add_argument("--debug", action="store_true")
-parser.add_argument( "--eval_official", action='store_true')
 parser.add_argument( "--save_image", action='store_true')
 parser.add_argument( "--save_video", action='store_true')
 parser.add_argument( "--save_cp", action='store_true')
@@ -270,6 +269,9 @@ parser.add_argument("--video_name", type=str, default="")
 parser.add_argument("--cp_name", type=str, default='')
 args = parser.parse_args() 
 print('args:', args)
+eval_state_dict = None
+if args.eval_cp:
+    eval_state_dict = torch.load(args.eval_cp, map_location='cpu')
  
 ##################################
 hf_dataset_repo = "physical-intelligence/libero"
@@ -354,15 +356,19 @@ text_encoder = AutoModel.from_pretrained(
     args.text_model,
     torch_dtype=torch.bfloat16,
 )
-text_lora_config = LoraConfig(
-    task_type=TaskType.FEATURE_EXTRACTION,
-    inference_mode=False,
-    r=args.text_lora_r,
-    lora_alpha=args.text_lora_alpha,
-    lora_dropout=args.text_lora_dropout,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+use_text_lora = (not args.eval_cp and not args.frozen_text_model) or (
+    args.eval_cp and eval_state_dict is not None and 'text_encoder_lora' in eval_state_dict
 )
-text_encoder = get_peft_model(text_encoder, text_lora_config)
+if use_text_lora:
+    text_lora_config = LoraConfig(
+        task_type=TaskType.FEATURE_EXTRACTION,
+        inference_mode=False,
+        r=args.text_lora_r,
+        lora_alpha=args.text_lora_alpha,
+        lora_dropout=args.text_lora_dropout,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    )
+    text_encoder = get_peft_model(text_encoder, text_lora_config)
 text_embed_dim = int(text_encoder.config.hidden_size)
 per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
 if args.net == "ConditionalUnet1D":
@@ -396,7 +402,7 @@ if args.frozen_text_model:
     nets['text_encoder'].eval()
     for p in nets['text_encoder'].parameters():
         p.requires_grad = False
-elif hasattr(nets['text_encoder'], "print_trainable_parameters"):
+elif use_text_lora and hasattr(nets['text_encoder'], "print_trainable_parameters"):
     nets['text_encoder'].print_trainable_parameters()
         
 ##################################################################
@@ -422,7 +428,7 @@ print('model initialized')
 #### Train the model
 for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
-    if (args.debug or args.eval_official) and epoch > 0 :
+    if (args.debug or args.eval_cp) and epoch > 0 :
         print('debug or test mode')
         os._exit(0)
 
@@ -570,7 +576,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         # ema.step(nets.parameters())
         ema.step(ema_params)
         
-        if (args.debug and ii >= 32)  or (args.eval_official and ii >= 4 )  :
+        if (args.debug and ii >= 32)  or args.eval_cp:
             break
     
     if epoch % 10 == 0 :
@@ -579,7 +585,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         
     
     # do evaluation below - inference
-    if (epoch in [50, 100, 150, 200, 300, 400, 500, 600, 800, 1000]) or args.debug or args.eval_official:
+    if (epoch in [50, 100, 150, 200, 300, 400, 500, 600, 800, 1000]) or args.debug or args.eval_cp:
 
         if args.save_cp:
             cp_save_path = "./checkpoints/libero/unet_qwen/"
@@ -587,23 +593,29 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             ema.store(ema_params) 
             ema.copy_to(ema_params)
             
-            torch.save({'vision_encoder': nets['vision_encoder'].state_dict(),
-                        'text_encoder_lora': get_peft_model_state_dict(nets['text_encoder']),
-                        'noise_pred_net': nets['noise_pred_net'].state_dict(),
-                        'epoch': epoch,
-                        'ema': ema.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        "args": vars(args)}, 
-                        f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
+            ckpt = {
+                'vision_encoder': nets['vision_encoder'].state_dict(),
+                'noise_pred_net': nets['noise_pred_net'].state_dict(),
+                'epoch': epoch,
+                'ema': ema.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                "args": vars(args),
+            }
+            if use_text_lora:
+                ckpt['text_encoder_lora'] = get_peft_model_state_dict(nets['text_encoder'])
+            else:
+                ckpt['text_encoder'] = nets['text_encoder'].state_dict()
+            torch.save(ckpt, f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
             ema.restore(ema_params)
             
-        if args.eval_official:
-            assert args.eval_cp is not None
+        if args.eval_cp:
             nets.eval()
-            state_dict = torch.load(args.eval_cp, map_location='cuda')
+            state_dict = eval_state_dict
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
             if 'text_encoder_lora' in state_dict:
+                if not use_text_lora:
+                    raise RuntimeError("Checkpoint contains LoRA weights but text LoRA was not initialized.")
                 set_peft_model_state_dict(nets['text_encoder'], state_dict['text_encoder_lora'])
             elif 'text_encoder' in state_dict:
                 nets.text_encoder.load_state_dict(state_dict['text_encoder'])
@@ -869,8 +881,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             
                             
                 
-                if args.debug or args.eval_official:
-                    epoch_ = 'eval_official'
+                if args.debug or args.eval_cp:
+                    epoch_ = 'eval_cp'
                 else:
                     epoch_ = epoch
                 
