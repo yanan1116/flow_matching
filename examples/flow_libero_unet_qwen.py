@@ -272,7 +272,8 @@ print('args:', args)
 eval_state_dict = None
 if args.eval_cp:
     eval_state_dict = torch.load(args.eval_cp, map_location='cpu')
- 
+    print("eval_cp---> args:", eval_state_dict.get("args"))
+
 ##################################
 hf_dataset_repo = "physical-intelligence/libero"
 action_dim = 7
@@ -623,6 +624,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                 print('warning: text_encoder not found in checkpoint, using current initialized weights')
             nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
             print('load official checkpoint success')
+
         
 
         for task_suite_name in benchmark_dict.keys():
