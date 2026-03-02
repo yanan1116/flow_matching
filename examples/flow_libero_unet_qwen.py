@@ -551,14 +551,13 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         if (args.debug and ii >= 32)  or (args.eval_official and ii >= 4 )  :
             break
     
-    
-    
+    if epoch % 10 == 0 :
+        avg_loss_train = total_loss_train / len(dataloader)
+        print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))    
+        
     
     # do evaluation below - inference
     if (epoch % args.eval_interval == 0 and epoch > 0) or args.debug or args.eval_official:
-
-        avg_loss_train = total_loss_train / len(dataloader)
-        print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))
 
         if args.save_cp:
             cp_save_path = "./checkpoints/libero/unet_qwen/"
