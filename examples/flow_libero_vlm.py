@@ -632,7 +632,7 @@ if not args.eval:
         else:
             vlm_encoder_model.train()
         
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="it", leave=False)
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="it", leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_noinv_fmt}{postfix}]")
         optimizer.zero_grad(set_to_none=True)
         for ii, batch in enumerate(pbar):
 
