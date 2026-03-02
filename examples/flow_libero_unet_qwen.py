@@ -257,6 +257,7 @@ parser.add_argument( "--save_video", action='store_true')
 parser.add_argument( "--save_cp", action='store_true')
 parser.add_argument("--eval_cp", type=str, default=None)
 parser.add_argument("--video_name", type=str, default="")
+parser.add_argument("--cp_name", type=str, default='')
 args = parser.parse_args() 
 print('args:', args)
  
@@ -573,7 +574,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         "args": vars(args)}, 
-                        f'{cp_save_path}/cp-{args.net}-{epoch}.pth')
+                        f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
             ema.restore(ema_params)
             
         if args.eval_official:
