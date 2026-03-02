@@ -759,7 +759,7 @@ if not args.eval:
             
         
         # save checkpoint
-        if (epoch+1) % args.save_interval  == 0  or args.debug :
+        if (epoch > 0 and epoch % args.save_interval  == 0 and args.cp_name) or args.debug :
             cp_save_path = "./checkpoints/libero/vlm/"
             os.makedirs(cp_save_path, exist_ok=True)
             ema.store(ema_params) 
