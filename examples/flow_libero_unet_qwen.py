@@ -665,7 +665,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                     if task_suite_name != 'libero_spatial' and task_id not in [1,2,3,4]:
                         continue
                     
-                    print('debug mode --> task:', task_description)
+                    print(f'debug mode --> task_id:{task_id}-->', task_description)
 
                 # Start episodes
                 print(f'task_id:{task_id} task_description:{task_description}')
