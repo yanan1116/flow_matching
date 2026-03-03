@@ -657,8 +657,16 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                 replay_images = []
                 task = task_suite.get_task(task_id)
 
+
                 # Initialize LIBERO environment and task description
                 env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, random.randint(1, 10000))
+
+                if args.debug:
+                    if task_suite_name != 'libero_spatial' and task_id not in [1,2,3,4]:
+                        continue
+                    else:
+                        print('debug mode --> task:', task_description)
+
                 # Start episodes
                 print(f'task_id:{task_id} task_description:{task_description}')
                 
