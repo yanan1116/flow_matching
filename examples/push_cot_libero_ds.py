@@ -1,5 +1,5 @@
 import argparse
-import re
+import re,os
 import shutil
 from pathlib import Path
 
@@ -28,8 +28,7 @@ def extract_cot(example):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo_id", type=str, default='')
-    parser.add_argument("--output_dir", type=str, default="")
-    parser.add_argument("--shuffle", action='store_true')
+    # parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--subsample_per_subset", type=int, default=0)
     return parser.parse_args()
 
@@ -46,8 +45,7 @@ def main():
             split='train',
             #cache_dir=args.cache_dir,
         )
-        if args.shuffle:
-            ds_part = ds_part.shuffle()
+
         if args.subsample_per_subset > 0:
             ds_part = ds_part.select(range(args.subsample_per_subset))
         
@@ -57,8 +55,10 @@ def main():
     base_ds = base_ds.filter(
         lambda ex: ex.get("annotation") is None,
         desc="Dropping rows with null annotation",
+        num_proc=os.cpu_count(),
     )
     base_ds = base_ds.map(extract_cot, 
+                        num_proc=os.cpu_count(),
                         remove_columns=["annotation", 'conversations'],
                         desc="Adding action_chunk and instruction")
 
