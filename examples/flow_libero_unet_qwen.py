@@ -267,6 +267,7 @@ parser.add_argument( "--save_cp", action='store_true')
 parser.add_argument("--eval_cp", type=str, default=None)
 parser.add_argument("--video_name", type=str, default="")
 parser.add_argument("--cp_name", type=str, default='')
+parser.add_argument("--ema", action="store_true")
 args = parser.parse_args() 
 print('args:', args)
 eval_state_dict = None
@@ -410,7 +411,7 @@ elif use_text_lora and hasattr(nets['text_encoder'], "print_trainable_parameters
 sigma = 0.0
 # ema_params = list(nets.parameters())
 ema_params = [p for p in nets.parameters() if p.requires_grad]
-ema = EMAModel(parameters=ema_params, power=0.75)
+ema = EMAModel(parameters=ema_params, power=0.75) if args.ema else None
 optimizer = torch.optim.AdamW(params=ema_params, lr=1e-4,weight_decay=1e-6)
 
 # optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4, weight_decay=1e-6)
@@ -573,9 +574,10 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         optimizer.zero_grad()
         lr_scheduler.step()
 
-        # update Exponential Moving Average of the model weights
-        # ema.step(nets.parameters())
-        ema.step(ema_params)
+        if args.ema:
+            # update Exponential Moving Average of the model weights
+            # ema.step(nets.parameters())
+            ema.step(ema_params)
         
         if (args.debug and ii >= 32)  or args.eval_cp:
             break
@@ -587,32 +589,37 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     
     # do evaluation below - inference
     if (epoch in [50, 100, 150, 200, 300, 400, 500, 600, 800, 1000]) or args.debug or args.eval_cp:
+        restore_raw_after_eval = False
 
         if args.save_cp:
             cp_save_path = "./checkpoints/libero/unet_qwen/"
             os.makedirs(cp_save_path, exist_ok=True)
-            ema.store(ema_params) 
-            ema.copy_to(ema_params)
-            
             ckpt = {
                 'vision_encoder': nets['vision_encoder'].state_dict(),
                 'noise_pred_net': nets['noise_pred_net'].state_dict(),
                 'epoch': epoch,
-                'ema': ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 "args": vars(args),
+                "model_weights": "raw",
             }
+
+            if args.ema:
+                ckpt['ema'] = ema.state_dict()
+
             if use_text_lora:
                 ckpt['text_encoder_lora'] = get_peft_model_state_dict(nets['text_encoder'])
             else:
                 ckpt['text_encoder'] = nets['text_encoder'].state_dict()
             torch.save(ckpt, f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
-            ema.restore(ema_params)
-            
+
         if args.eval_cp:
             nets.eval()
             state_dict = eval_state_dict
+            saved_args = state_dict.get("args") or {}
+            model_weights = state_dict.get("model_weights")
+            if model_weights is None:
+                model_weights = "ema" if saved_args.get("ema") else "raw"
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
             if 'text_encoder_lora' in state_dict:
                 if not use_text_lora:
@@ -623,7 +630,23 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             else:
                 print('warning: text_encoder not found in checkpoint, using current initialized weights')
             nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
+            if args.ema:
+                if 'ema' in state_dict:
+                    ema.load_state_dict(state_dict['ema'])
+                    ema.copy_to(ema_params)
+                elif model_weights == "ema":
+                    print('warning: legacy checkpoint stores EMA weights directly; using loaded model weights as EMA.')
+                else:
+                    raise RuntimeError("EMA requested, but checkpoint does not contain EMA state.")
+            elif model_weights == "ema":
+                print('warning: legacy checkpoint stores EMA weights directly; raw weights are unavailable in this checkpoint.')
             print('load official checkpoint success')
+        else:
+            nets.eval()
+            if args.ema:
+                ema.store(ema_params)
+                ema.copy_to(ema_params)
+                restore_raw_after_eval = True
 
         
 
@@ -905,5 +928,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
  
             print('-'*20)    
+
+        if restore_raw_after_eval:
+            ema.restore(ema_params)
     
     
