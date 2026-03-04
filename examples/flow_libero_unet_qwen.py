@@ -321,8 +321,8 @@ ds = LiberoWindowedDataset(base_ds,
                            task_map=task_map)
 
 dataloader = DataLoader(ds, batch_size=args.batchsize, shuffle=True, 
-                            num_workers=16, pin_memory=True,
-                            persistent_workers=True, prefetch_factor=4,
+                            num_workers=6, pin_memory=True,
+                            persistent_workers=True, prefetch_factor=2,
                             collate_fn=collate_with_task_text)
 
 batch = next(iter(dataloader))
