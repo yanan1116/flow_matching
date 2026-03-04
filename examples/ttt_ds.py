@@ -1,14 +1,10 @@
 import argparse
-import re,os
+import re,os,random
 import shutil
 from pathlib import Path
 from collections import Counter
-
-from datasets import concatenate_datasets, load_dataset, DownloadConfig
-
-
-
-
+from datasets import concatenate_datasets, load_dataset, DownloadConfig, Image
+import numpy as np 
 
 meta = load_dataset(
     'physical-intelligence/libero',
@@ -31,33 +27,72 @@ ds_libero = load_dataset(
     split="train",
 )
 ds_libero = ds_libero.map(add_instruction, num_proc=8, desc='add instruction')
-print(ds_libero.num_rows)
-print(ds_libero.features)
+print('ds_libero:', ds_libero.num_rows, ds_libero.features)
+ # 273465 
+ # {'image': Image(mode=None, decode=True), 'wrist_image': Image(mode=None, decode=True), 
+ # 'state': List(Value('float32'), length=8), 'actions': List(Value('float32'), length=7), 
+ # 'timestamp': Value('float32'), 'frame_index': Value('int64'), 'episode_index': Value('int64'), 
+ # 'index': Value('int64'), 'task_index': Value('int64'), 'instruction': Value('string')}
 
-os._exit(0)
+
+# print('ds_libero images:')
+# idxs = random.sample(range(ds_libero.num_rows), 5)
+# for i, idx in enumerate(idxs):
+#     sample = ds_libero[idx]
+#     img = sample["image"]  # PIL.Image.Image (decode=True 时)
+#     print(f"sample {i}: idx={idx}, type={type(img)}, size={img.size}, mode={img.mode}")
+#     img_arr = np.array(img)
+#     print(img_arr)
+
+
 
 
 
 ds_molmoact = load_dataset(
             "yananchen/molmoact_libero_cot",
+            # "yananchen/molmoact_libero_map_sample",
             split='train', 
             download_config=DownloadConfig(local_files_only=True)
-            #cache_dir=args.cache_dir,
         )
-num_proc = max(1, os.cpu_count() or 1)
-ds_molmoact = ds_molmoact.map(
-    lambda ex: {"instruction": ex["instruction"].rstrip(".")},
-    num_proc=num_proc,
-)
+ds_molmoact = ds_molmoact.cast_column("image", Image(decode=True))
+ds_molmoact = ds_molmoact.cast_column("wrist", Image(decode=True))
+
+
+print('ds_molmoact:', ds_molmoact.num_rows, ds_molmoact.features)
+
+# 260303 {'image': Image(mode=None, decode=True), 'wrist': Image(mode=None, decode=True), 
+# 'action_chunk': Value('string'), 'instruction': Value('string'), 
+# 'eef_traj': Value('string'), 'depth': Value('string')}
+
+
+
+print('ds_molmoact images:')
+idxs = random.sample(range(ds_molmoact.num_rows), 5)
+for i, idx in enumerate(idxs):
+    sample = ds_molmoact[idx]
+    img = sample["image"]  # PIL.Image.Image (decode=True 时)
+
+    print(f"sample {i}: idx={idx}, type={type(img)}, size={img.size}, mode={img.mode}")
+    img_arr = np.array(img)
+    print(img_arr)
+
 
 instruction_list = ds_molmoact["instruction"]
-counts = Counter(instruction_list)
-instructions = set(counts)
-missing = instructions - tasks_desc_set
-assert len(missing) == 0 , f"Found instructions not in tasks_desc_set: {sorted(missing)}"
 
-for task in sorted(instructions):
-    print(f'{task}===> {counts[task]}')
+print('instruction_list type', type(instruction_list))
+print(instruction_list[0])
+
+counts = Counter(instruction_list)
+for ii in set(list(instruction_list)):
+    assert ii in tasks_desc_set
+
+
+
+
+
+
+
+
 
 '''
 open the middle drawer of the cabinet===> 5564

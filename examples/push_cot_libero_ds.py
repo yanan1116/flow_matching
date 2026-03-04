@@ -20,9 +20,9 @@ def extract_cot(example):
     instruction = instruction_full.split('What is the action that the robot should take')[0].strip()
     
     return {"action_chunk": action_chunk, 
-            "instruction": instruction.replace('The task is','').strip(), 
-            'eef_traj': eef_traj, 
-            'depth':depth }
+            "instruction": instruction.replace('The task is','').strip().rstrip(".").strip(), 
+            'eef_traj': eef_traj.replace('The trajectory of the end effector in the first image is','').strip(), 
+            'depth':depth.replace('The depth map of the first image is','').strip() }
 
 
 def parse_args():
@@ -61,6 +61,8 @@ def main():
                         num_proc=os.cpu_count(),
                         remove_columns=["annotation", 'conversations'],
                         desc="Adding action_chunk and instruction")
+
+
 
 
     print("base_ds info:", base_ds, "\n", base_ds.features)
