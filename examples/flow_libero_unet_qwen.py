@@ -249,6 +249,7 @@ parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
 parser.add_argument("--num_epochs", type=int, default=3000)
 parser.add_argument("--batchsize", type=int, default=128)
+parser.add_argument("--batch_earlystop", type=int, default=-1)
 # parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
 parser.add_argument("--action_horizon", type=int, default=8)
@@ -584,9 +585,9 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             # ema.step(nets.parameters())
             ema.step(ema_params)
         
-        if (args.debug and ii >= 32)  or args.eval_cp :
+        if (args.debug and ii >= 32)  or args.eval_cp or (args.batch_earlystop == ii ):
             break
-    
+
     if epoch % 10 == 0 :
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))    
