@@ -270,6 +270,8 @@ parser.add_argument("--video_name", type=str, default="")
 parser.add_argument("--cp_name", type=str, default='')
 parser.add_argument("--ema", action="store_true")
 parser.add_argument("--eval_realtime", action="store_true")
+parser.add_argument("--num_workers", type=int, default=16)
+parser.add_argument("--prefetch_factor", type=int, default=4)
 args = parser.parse_args() 
 if args.eval_cp and args.eval_realtime:
     raise ValueError("--eval_cp and --eval_realtime cannot be used together")
@@ -321,8 +323,8 @@ ds = LiberoWindowedDataset(base_ds,
                            task_map=task_map)
 
 dataloader = DataLoader(ds, batch_size=args.batchsize, shuffle=True, 
-                            num_workers=6, pin_memory=True,
-                            persistent_workers=True, prefetch_factor=2,
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=True, prefetch_factor=args.prefetch_factor,
                             collate_fn=collate_with_task_text)
 
 batch = next(iter(dataloader))
