@@ -436,7 +436,7 @@ print('model initialized')
 #### Train the model
 for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
-    if (args.debug or args.eval_cp) and epoch > 0 :
+    if args.eval_cp or (args.debug and epoch > 3 )  :
         print('debug or test mode')
         os._exit(0)
 
@@ -584,7 +584,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             # ema.step(nets.parameters())
             ema.step(ema_params)
         
-        if (args.debug and ii >= 32)  or args.eval_cp:
+        if (args.debug and ii >= 32)  or args.eval_cp :
             break
     
     if epoch % 10 == 0 :
