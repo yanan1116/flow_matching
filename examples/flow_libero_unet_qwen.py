@@ -247,7 +247,7 @@ parser.add_argument("--net", type=str, default="ConditionalUnet1D", choices=["Tr
 # parser.add_argument("--frozen_vision", action="store_true")
 parser.add_argument("--normalize_images_01", action="store_true")
 parser.add_argument("--n_test", type=int, default=50)
-parser.add_argument("--num_epochs", type=int, default=1000)
+parser.add_argument("--num_epochs", type=int, default=3000)
 parser.add_argument("--batchsize", type=int, default=128)
 # parser.add_argument("--eval_interval", type=int, default=100)
 parser.add_argument("--obs_horizon", type=int, default=1)
@@ -268,8 +268,14 @@ parser.add_argument("--eval_cp", type=str, default=None)
 parser.add_argument("--video_name", type=str, default="")
 parser.add_argument("--cp_name", type=str, default='')
 parser.add_argument("--ema", action="store_true")
+parser.add_argument("--eval_realtime", action="store_true")
 args = parser.parse_args() 
+if args.eval_cp and args.eval_realtime:
+    raise ValueError("--eval_cp and --eval_realtime cannot be used together")
 print('args:', args)
+
+eval_epoch_milestones = [100, 200, 300, 400, 500, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2400, 2600, 2800]
+
 eval_state_dict = None
 if args.eval_cp:
     eval_state_dict = torch.load(args.eval_cp, map_location='cpu')
@@ -333,6 +339,7 @@ assert isinstance(batch["task_text"], list)
 # os._exit(0)
 
 if args.save_image:
+    os.makedirs('./saved_images', exist_ok=True)
     imgs = batch["image"]   # shape: [B, O, 3, 256, 256]
     B, O, C, H, W = imgs.shape
     N = 5
@@ -345,7 +352,7 @@ if args.save_image:
         else:
             img = np.clip(img, 0.0, 255.0)
         img = img.astype(np.uint8)
-        Image.fromarray(img).save(f"saved_images/libero_hf_image_{i}.png")
+        Image.fromarray(img).save(f"./saved_images/libero_hf_image_{i}.png")
 # images are in normal orientation
 
 
@@ -358,10 +365,8 @@ text_encoder = AutoModel.from_pretrained(
     args.text_model,
     torch_dtype=torch.bfloat16,
 )
-use_text_lora = (not args.eval_cp and not args.frozen_text_model) or (
-    args.eval_cp and eval_state_dict is not None and 'text_encoder_lora' in eval_state_dict
-)
-if use_text_lora:
+
+if not args.frozen_text_model:
     text_lora_config = LoraConfig(
         task_type=TaskType.FEATURE_EXTRACTION,
         inference_mode=False,
@@ -371,6 +376,7 @@ if use_text_lora:
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     text_encoder = get_peft_model(text_encoder, text_lora_config)
+
 text_embed_dim = int(text_encoder.config.hidden_size)
 per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
 if args.net == "ConditionalUnet1D":
@@ -404,7 +410,7 @@ if args.frozen_text_model:
     nets['text_encoder'].eval()
     for p in nets['text_encoder'].parameters():
         p.requires_grad = False
-elif use_text_lora and hasattr(nets['text_encoder'], "print_trainable_parameters"):
+else:
     nets['text_encoder'].print_trainable_parameters()
         
 ##################################################################
@@ -433,7 +439,6 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
     if (args.debug or args.eval_cp) and epoch > 0 :
         print('debug or test mode')
         os._exit(0)
-
 
     total_loss_train = 0.0
     
@@ -587,48 +592,69 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))    
         
     
+
+    if args.save_cp and epoch in eval_epoch_milestones: # save checkpint at some intervals
+        cp_save_path = "./checkpoints/libero/unet_qwen/"
+        os.makedirs(cp_save_path, exist_ok=True)
+        ckpt = {
+            'vision_encoder': nets['vision_encoder'].state_dict(),
+            'noise_pred_net': nets['noise_pred_net'].state_dict(),
+            'epoch': epoch,
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            "args": vars(args),
+            "model_weights": "raw",
+        }
+
+        if args.ema:
+            ckpt['ema'] = ema.state_dict()
+
+        if not args.frozen_text_model:
+            ckpt['text_encoder_lora'] = get_peft_model_state_dict(nets['text_encoder'])
+     
+        torch.save(ckpt, f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
+
     # do evaluation below - inference
-    if (epoch in [50, 100, 150, 200, 300, 400, 500, 600, 800, 1000]) or args.debug or args.eval_cp:
+    if  args.debug or args.eval_cp or (args.eval_realtime and epoch in eval_epoch_milestones):
         restore_raw_after_eval = False
 
-        if args.save_cp:
-            cp_save_path = "./checkpoints/libero/unet_qwen/"
-            os.makedirs(cp_save_path, exist_ok=True)
-            ckpt = {
-                'vision_encoder': nets['vision_encoder'].state_dict(),
-                'noise_pred_net': nets['noise_pred_net'].state_dict(),
-                'epoch': epoch,
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                "args": vars(args),
-                "model_weights": "raw",
-            }
-
-            if args.ema:
-                ckpt['ema'] = ema.state_dict()
-
-            if use_text_lora:
-                ckpt['text_encoder_lora'] = get_peft_model_state_dict(nets['text_encoder'])
-            else:
-                ckpt['text_encoder'] = nets['text_encoder'].state_dict()
-            torch.save(ckpt, f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
-
-        if args.eval_cp:
+        if args.eval_cp: # if eval_cp is not none, then load the checkpoint
             nets.eval()
             state_dict = eval_state_dict
             saved_args = state_dict.get("args") or {}
+            compatibility_keys = [
+                "net",
+                "obs_horizon",
+                "action_horizon",
+                "pred_horizon",
+                "text_model",
+                "text_max_len",
+                "text_pool",
+                "frozen_text_model",
+            ]
+            incompatible = [
+                f"{key}: current={getattr(args, key)!r}, checkpoint={saved_args.get(key)!r}"
+                for key in compatibility_keys
+                if key in saved_args and saved_args.get(key) != getattr(args, key)
+            ]
+            if incompatible:
+                raise RuntimeError(
+                    "Checkpoint args are incompatible with current args: "
+                    + "; ".join(incompatible)
+                )
+
             model_weights = state_dict.get("model_weights")
             if model_weights is None:
                 model_weights = "ema" if saved_args.get("ema") else "raw"
             nets.vision_encoder.load_state_dict(state_dict['vision_encoder'])
-            if 'text_encoder_lora' in state_dict:
-                if not use_text_lora:
-                    raise RuntimeError("Checkpoint contains LoRA weights but text LoRA was not initialized.")
+
+            if not args.frozen_text_model:
+                assert 'text_encoder_lora' in state_dict, 'eval on trained model, text_encoder_lora must exist'
                 set_peft_model_state_dict(nets['text_encoder'], state_dict['text_encoder_lora'])
-            elif 'text_encoder' in state_dict:
-                nets.text_encoder.load_state_dict(state_dict['text_encoder'])
             else:
-                print('warning: text_encoder not found in checkpoint, using current initialized weights')
+                assert 'text_encoder_lora' not in state_dict, 'eval on frozen model, text_encoder_lora should not be there'
+
+
             nets.noise_pred_net.load_state_dict(state_dict['noise_pred_net'])
             if args.ema:
                 if 'ema' in state_dict:
@@ -699,7 +725,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                     print(task_id , 'initial_states length < 50 :', len(initial_states))
                 
                 n_test_actual = min(len(initial_states), args.n_test)
-
+                assert n_test_actual >= 10
                 # print('initial_states cnt:', len(initial_states), '\n')
                 # continue
 
@@ -911,14 +937,8 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                                 done = True
                                 print(f'trial {trail_ix} fail')
                                 break 
-                            
-                            
-                
-                if args.debug or args.eval_cp:
-                    epoch_ = 'eval_cp'
-                else:
-                    epoch_ = epoch
-                
+
+                epoch_ = 'eval_cp'
                 if args.save_video:
                     imageio.mimwrite( f"./saved_videos/rollout_{args.video_name}_epoch_{epoch_}_{task_suite_name}_taskid_{task_id}_success_{n_success}_total_{n_test_actual}.mp4", [np.asarray(x) for x in replay_images], fps=10)
                     
