@@ -421,12 +421,13 @@ elif args.net == 'ConditionalUnet1D':
 else:
     raise ValueError("net not found")
 
-nets = nn.ModuleDict({
+module_dict = {
     'vision_encoder': vision_encoder,
     'noise_pred_net': noise_pred_net
-}).to(device, dtype=torch.bfloat16)
+}
 if not args.disable_text_input:
-    nets['text_encoder'] = text_encoder
+    module_dict['text_encoder'] = text_encoder
+nets = nn.ModuleDict(module_dict).to(device, dtype=torch.bfloat16)
     
 
 if not args.disable_text_input:
