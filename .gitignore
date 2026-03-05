@@ -6,3 +6,4 @@ saved_videos/
 logs/
 __pycache__/
 *.pyc
+*.pkl
