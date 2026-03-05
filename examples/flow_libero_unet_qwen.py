@@ -272,9 +272,13 @@ parser.add_argument("--ema", action="store_true")
 parser.add_argument("--eval_realtime", action="store_true")
 parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--prefetch_factor", type=int, default=2)
+parser.add_argument("--disable_text_input", action='store_true')
 args = parser.parse_args() 
 if args.eval_cp and args.eval_realtime:
     raise ValueError("--eval_cp and --eval_realtime cannot be used together")
+
+if args.disable_text_input:
+    assert args.frozen_text_model , 'when disable_text_input, text model should be frozen'
 print('args:', args)
 
 eval_epoch_milestones = [100, 200, 300, 400, 500, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2400, 2600, 2800]
@@ -381,7 +385,10 @@ if not args.frozen_text_model:
     text_encoder = get_peft_model(text_encoder, text_lora_config)
 
 text_embed_dim = int(text_encoder.config.hidden_size)
-per_timestep_cond_dim = 512*2 + 8 + text_embed_dim  # 1032 + text
+
+
+
+per_timestep_cond_dim = 512*2 + 8 + (0 if args.disable_text_input else text_embed_dim  )
 if args.net == "ConditionalUnet1D":
     global_cond_dim = per_timestep_cond_dim * args.obs_horizon
 elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
@@ -545,12 +552,17 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             assert text_feat.dtype == torch.bfloat16
         
         # print('train x_pos_rep:', x_pos_rep.shape) 
-         
-        obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
-        # print('train obs_features:', obs_features.shape) 
-        
-        # expected dimension of per-timestep cond 
-        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
+        if args.disable_text_input:
+            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
+            # print('train obs_features:', obs_features.shape) 
+            # expected dimension of per-timestep cond 
+            expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1]
+
+        else:
+            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
+            # print('train obs_features:', obs_features.shape) 
+            # expected dimension of per-timestep cond 
+            expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
 
         B, O = x_main_img.shape[:2]
 
@@ -859,12 +871,17 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
                             if args.debug:
                                 assert text_feat.shape[:2] == main_feat.shape[:2]
                                 assert text_feat.dtype == torch.bfloat16
-
-                            obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
+                            if args.disable_text_input:
+                                obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep], dim=-1)
+                            else:
+                                obs_features = torch.cat([ main_feat,  wrist_feat,  x_pos_rep, text_feat], dim=-1)
                             # print('infer obs_features:', obs_features.shape) 
-                        
-                        # expected dimension of per-timestep cond 
-                        expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
+
+                        # expected dimension of per-timestep cond                       
+                        if args.disable_text_input:
+                            expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1]
+                        else: 
+                            expected_feat_dim = main_feat.shape[-1] + wrist_feat.shape[-1] + x_pos_rep.shape[-1] + text_feat.shape[-1]
 
                         B, O, D = obs_features.shape
                         # 1) check obs_features 

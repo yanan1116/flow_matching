@@ -14,13 +14,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-from datasets import Image, load_dataset
+from datasets import DownloadMode, Image, config as ds_config, load_dataset
+from huggingface_hub import HfApi
+from tqdm import tqdm
 
 
 WS_RE = re.compile(r"\s+")
@@ -66,10 +71,10 @@ def image_like_to_bytes(v) -> bytes:
 
 
 def make_key(instruction: str, image_v, wrist_v) -> str:
-    inst = normalize_instruction(instruction)
+    # inst = normalize_instruction(instruction)
     img_h = hash_bytes(image_like_to_bytes(image_v))
     wrs_h = hash_bytes(image_like_to_bytes(wrist_v))
-    return f"{inst}|{img_h}|{wrs_h}"
+    return f"{instruction}|{img_h}|{wrs_h}"
 
 
 def ensure_decode_false(ds, col_name: str):
@@ -77,6 +82,8 @@ def ensure_decode_false(ds, col_name: str):
     if isinstance(feat, Image) and getattr(feat, "decode", True):
         ds = ds.cast_column(col_name, Image(decode=False))
     return ds
+
+
 
 
 def build_molmo_index(
@@ -108,12 +115,21 @@ def build_molmo_index(
 
     return index, ambiguous
 
+meta = load_dataset(
+    'physical-intelligence/libero',
+    data_files="meta/tasks.jsonl",
+    split="train",
+)
+task_map = {row["task_index"]: row["task"] for row in meta}
+
+def add_instruction(example):
+    instruction = task_map[example['task_index']]
+    return {'instruction': instruction}
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--libero_repo", default="physical-intelligence/libero")
     parser.add_argument("--molmo_repo", default="yananchen/molmoact_libero_cot")
-    parser.add_argument("--split", default="train")
 
     parser.add_argument("--instruction_col", default="instruction")
     parser.add_argument("--libero_image_col", default="image")
@@ -122,17 +138,21 @@ def main() -> None:
     parser.add_argument("--molmo_wrist_col", default="wrist")
     parser.add_argument("--depth_col", default="depth")
     parser.add_argument("--eef_traj_col", default="eef_traj")
-
-    parser.add_argument(
-        "--output_parquet",
-        default="",
-        help="Optional path to write ds_libero with joined columns.",
-    )
     args = parser.parse_args()
 
     print("Loading datasets...")
-    ds_libero = load_dataset(args.libero_repo, split=args.split)
-    ds_molmo = load_dataset(args.molmo_repo, split=args.split)
+    ds_libero = load_dataset(
+        path=args.libero_repo,
+        split='train',
+    )
+
+    ds_libero = ds_libero.map(add_instruction, num_proc=16, desc='add instruction')
+
+
+    ds_molmo = load_dataset(
+        path=args.molmo_repo,
+        split='train',
+    )
     print(f"ds_libero: {len(ds_libero)} rows")
     print(f"ds_molmoact: {len(ds_molmo)} rows")
 
@@ -140,14 +160,9 @@ def main() -> None:
     ds_libero = ensure_decode_false(ds_libero, args.libero_wrist_col)
     ds_molmo = ensure_decode_false(ds_molmo, args.molmo_image_col)
     ds_molmo = ensure_decode_false(ds_molmo, args.molmo_wrist_col)
-    ds_molmo = ds_molmo.map(
-                lambda ex: {"instruction": ex["instruction"].rstrip(".")},
-                    num_proc=16,
-                )
-
 
     print("Building exact index from ds_molmoact...")
-    molmo_index, ambiguous_keys = build_molmo_index(
+    molmo_index, ambiguous_keys_cnt = build_molmo_index(
         ds_molmo,
         instruction_col=args.instruction_col,
         image_col=args.molmo_image_col,
@@ -159,7 +174,8 @@ def main() -> None:
     unique_keys = sum(v is not None for v in molmo_index.values())
     print(f"molmo_index keys: {len(molmo_index)}")
     print(f"molmo_unique_keys: {unique_keys}")
-    print(f"molmo_ambiguous_keys: {ambiguous_keys}")
+    print(f"molmo_ambiguous_keys: {ambiguous_keys_cnt}")
+    assert ambiguous_keys_cnt == 0
 
     print("Joining onto ds_libero...")
     matched = 0
@@ -168,44 +184,28 @@ def main() -> None:
     joined_depth = []
     joined_eef = []
 
-    for ex in ds_libero:
+    for ex in tqdm(ds_libero, total=len(ds_libero), desc="Joining ds_libero"):
+
         key = make_key(ex[args.instruction_col], ex[args.libero_image_col], ex[args.libero_wrist_col])
         payload = molmo_index.get(key, "MISS")
         if payload == "MISS":
             unmatched += 1
-            joined_depth.append(None)
-            joined_eef.append(None)
-        elif payload is None:
-            ambiguous_hit += 1
-            joined_depth.append(None)
-            joined_eef.append(None)
         else:
+            assert payload
             matched += 1
             joined_depth.append(payload.depth)
             joined_eef.append(payload.eef_traj)
 
-    total = len(ds_libero)
-    hit_rate = (matched / total) if total else 0.0
-    miss_rate = (unmatched / total) if total else 0.0
-    ambiguous_rate = (ambiguous_hit / total) if total else 0.0
+    hit_rate = matched / len(ds_libero)
+    miss_rate = unmatched / len(ds_libero)
 
-    print("\n=== Stage-1 Exact Join Stats ===")
     print(f"total_libero: {total}")
     print(f"matched: {matched}")
     print(f"unmatched: {unmatched}")
-    print(f"ambiguous_hit: {ambiguous_hit}")
     print(f"hit_rate: {hit_rate:.6f}")
     print(f"miss_rate: {miss_rate:.6f}")
-    print(f"ambiguous_rate: {ambiguous_rate:.6f}")
 
-    if args.output_parquet:
-        out_dir = os.path.dirname(args.output_parquet)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        ds_out = ds_libero.add_column("joined_depth", joined_depth)
-        ds_out = ds_out.add_column("joined_eef_traj", joined_eef)
-        ds_out.to_parquet(args.output_parquet)
-        print(f"Wrote joined dataset parquet: {args.output_parquet}")
+
 
 
 if __name__ == "__main__":
