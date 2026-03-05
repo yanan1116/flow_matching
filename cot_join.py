@@ -187,14 +187,14 @@ def main() -> None:
     joined_depth = []
     joined_eef = []
 
-    missed_task_index = set()
+    missed_task_episode_index = set()
     for ex in tqdm(ds_libero, total=len(ds_libero), desc="Joining ds_libero"):
 
         key = make_key(ex[args.instruction_col], ex[args.libero_image_col], ex[args.libero_wrist_col])
         payload = molmo_index.get(key, None)
         if not payload:
             unmatched += 1
-            missed_task_index.add(ex['task_index'])
+            missed_task_episode_index.add(f"{ex['task_index']}-{ex['episode_index']}" )
             joined_depth.append('')
             joined_eef.append('')            
         else:
@@ -202,22 +202,21 @@ def main() -> None:
             joined_eef.append(payload.eef_traj)
 
     print(f"unmatched: {unmatched}", unmatched / len(ds_libero))
-    print( "missed_task_index:", len(missed_task_index), len(missed_task_index) /  len(ds_libero_task_index) )
+    print( "missed_task_episode_index:", len(missed_task_episode_index), len(missed_task_episode_index) / len(ds_libero) )
 
     assert len(joined_depth) == len(ds_libero)
     assert len(joined_eef) == len(ds_libero)
 
     ds_libero = ds_libero.add_column("depth", joined_depth)
     ds_libero = ds_libero.add_column("eef_traj", joined_eef)
-    # ds_libero_filter = ds_libero.filter(lambda ex: ex['task_index'] not in missed_task_index)
-    ds_libero_filter = ds_libero.filter(lambda ex: ex['depth'] != '' and ex['eef_traj'] != '')
-
+    ds_libero_filter = ds_libero.filter(lambda ex: f"{ex['task_index']}-{ex['episode_index']}" not in missed_task_episode_index)
+    # ds_libero_filter = ds_libero.filter(lambda ex: ex['depth'] != '' and ex['eef_traj'] != '')
     print('ds_libero_filter:', ds_libero_filter.num_rows / ds_libero.num_rows)
-
-    ds_libero_sample = ds_libero_filter.select(range(10000))
+    print("ds_libero_filter has blank cot:", ds_libero_filter.filter(lambda ex: ex['depth'] == '' or  ex['eef_traj'] == '').num_rows)
+    # ds_libero_sample = ds_libero_filter.select(range(10000))
 
     ds_libero_filter.push_to_hub(
-        f"yananchen/libero_cot",
+        f"yananchen/libero_cot_contious",
         private=False,
         embed_external_files=True,
     )
