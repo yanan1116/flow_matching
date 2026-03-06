@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import ast
 import copy
 import sys,random,time
 sys.dont_write_bytecode = True
@@ -109,29 +110,38 @@ def hf_transform(ex):
 
 
 def serialize_depth_to_tokens(depth_field):
-    arr = np.asarray(depth_field)
-    if arr.size == 0:
-        return "<DEPTH_START> <DEPTH_END>"
+    if not isinstance(depth_field, str):
+        raise TypeError(f"depth_field must be str, got {type(depth_field)}")
+    s = depth_field.strip()
+    if "<DEPTH_START>" not in s or "<DEPTH_END>" not in s:
+        raise ValueError(f"Unsupported depth string format: {s[:128]}...")
+    if " " not in s:
+        s = s.replace("><", "> <")
+    return s
 
-    arr = np.squeeze(arr)
-    if arr.ndim == 0:
-        arr = arr.reshape(1)
 
-    arr = arr.astype(np.float32, copy=False)
-    finite_mask = np.isfinite(arr)
-    if not np.all(finite_mask):
-        arr = np.where(finite_mask, arr, 0.0)
+def serialize_eef_to_tokens(eef_traj):
+    if not isinstance(eef_traj, str):
+        raise TypeError(f"eef_traj must be str, got {type(eef_traj)}")
+    s = eef_traj.strip()
+    try:
+        coords = ast.literal_eval(s)
+    except Exception as exc:
+        raise ValueError(f"Unsupported eef_traj format: {s[:128]}...") from exc
 
-    arr_min = float(arr.min())
-    arr_max = float(arr.max())
-    if arr_min >= 0.0 and arr_max <= 1.0 + 1e-6:
-        arr = np.rint(arr * 256.0)
-    else:
-        arr = np.rint(arr)
-
-    arr = np.clip(arr, 0, 256).astype(np.int64, copy=False)
-    tokens = [f"<DEPTH_{int(v)}>" for v in arr.reshape(-1).tolist()]
-    return " ".join(["<DEPTH_START>"] + tokens + ["<DEPTH_END>"])
+    tokens = ["<EEF_START>"]
+    for point in coords:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError(f"Each eef point must be a pair, got: {point!r}")
+        x, y = point
+        x = int(x)
+        y = int(y)
+        if not (0 <= x <= 255 and 0 <= y <= 255):
+            raise ValueError(f"EEF coordinates out of range [0,255]: {(x, y)}")
+        tokens.append(f"<EEF_X_{x}>")
+        tokens.append(f"<EEF_Y_{y}>")
+    tokens.append("<EEF_END>")
+    return " ".join(tokens)
 
 class LiberoWindowedDataset(Dataset):
     """
@@ -224,7 +234,7 @@ class LiberoWindowedDataset(Dataset):
         sample["task_text"] = self.task_map[ti]
         # Use current observation frame as CoT supervision target to avoid future leakage.
         sample["depth_text"] = serialize_depth_to_tokens(self.depth[int(obs_ids[0])])
-        sample["eef_text"] = str(self.eef_traj[int(obs_ids[0])])
+        sample["eef_text"] = serialize_eef_to_tokens(self.eef_traj[int(obs_ids[0])])
         
         return sample
 
@@ -396,8 +406,13 @@ if tokenizer.pad_token is None:
 special_tokens = ["<DEPTH_START>", "<DEPTH_END>"] + [
     f"<DEPTH_{i}>" for i in range(256 + 1)
 ]
+special_tokens += ["<EEF_START>", "<EEF_END>"] + [
+    f"<EEF_X_{i}>" for i in range(256)
+] + [
+    f"<EEF_Y_{i}>" for i in range(256)
+]
 n_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-print(f"depth special tokens added: {n_added}")
+print(f"structured special tokens added: {n_added}")
 
 task_text_enc = tokenizer(
     task_texts,
