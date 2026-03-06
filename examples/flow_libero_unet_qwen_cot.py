@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import ast
-import copy
 import sys,random,time
 sys.dont_write_bytecode = True
 sys.path.append('./external/models')
@@ -15,11 +14,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 from tqdm import tqdm
-from resnet import get_resnet
-from TransformerForDiffusion import TransformerForDiffusion
-from resnet import replace_bn_with_gn
 import collections
 # from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
@@ -31,15 +26,11 @@ from torchcfm.conditional_flow_matching import *
 from torchcfm.utils import *
 from torchcfm.models.models import *
 import pygame,h5py,argparse
-from unet import ConditionalUnet1D
 from peft import (
-    LoraConfig,
-    TaskType,
-    get_peft_model,
     get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer
 # from utils import *
 from datasets import load_dataset
 
@@ -51,13 +42,19 @@ print('bddl files path:', get_libero_path("bddl_files"))
 from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from PIL import Image
-import io
-from torchvision.transforms.functional import pil_to_tensor
 from datasets import load_dataset
+from utils import (
+    _get_libero_env,
+    _quat2axisangle,
+    _to_chw_float,
+    LiberoWindowedDataset as BaseLiberoWindowedDataset,
+    get_state,
+    hf_transform,
+    eval_epoch_milestones, LIBERO_ENV_RESOLUTION, LIBERO_DUMMY_ACTION
+)
+from model_builders import build_flow_libero_unet_qwen_cot_model
 
 benchmark_dict = benchmark.get_benchmark_dict()
-LIBERO_ENV_RESOLUTION = 256
-LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 num_steps_wait = 10
 video_out_path: str = "./saved_videos"
 
@@ -67,83 +64,7 @@ print = functools.partial(print, flush=True)
 # Avoid tokenizer parallelism warnings when DataLoader forks
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-
-def _ensure_pil_rgb(img):
-    if isinstance(img, Image.Image):
-        return img.convert("RGB")
-    if torch.is_tensor(img):
-        return img
-    if isinstance(img, dict):
-        if img.get("bytes") is not None:
-            return Image.open(io.BytesIO(img["bytes"])).convert("RGB")
-        if img.get("path") is not None:
-            return Image.open(img["path"]).convert("RGB")
-    raise TypeError(f"Unsupported image type: {type(img)}")
-
-
-def _to_chw_float(img, normalize_01=True):
-    # img 可能已经是 torch.uint8 CHW（来自 with_transform）
-    if torch.is_tensor(img):
-        t = img
-    else:
-        t = pil_to_tensor(_ensure_pil_rgb(img))
-    t = t.float()
-    if normalize_01:
-        t = t / 255.0
-    return t
-
-def hf_transform(ex):
-    # HF 可能传单条 / batch；元素可能是 PIL，也可能是 {"bytes","path"} 字典
-    if "image" in ex:
-        if isinstance(ex["image"], list):
-            ex["image"] = [pil_to_tensor(_ensure_pil_rgb(im)) for im in ex["image"]]
-        else:
-            ex["image"] = pil_to_tensor(_ensure_pil_rgb(ex["image"]))
-
-    if "wrist_image" in ex:
-        if isinstance(ex["wrist_image"], list):
-            ex["wrist_image"] = [pil_to_tensor(_ensure_pil_rgb(im)) for im in ex["wrist_image"]]
-        else:
-            ex["wrist_image"] = pil_to_tensor(_ensure_pil_rgb(ex["wrist_image"]))
-
-    return ex
-
-
-def serialize_depth_to_tokens(depth_field):
-    if not isinstance(depth_field, str):
-        raise TypeError(f"depth_field must be str, got {type(depth_field)}")
-    s = depth_field.strip()
-    if "<DEPTH_START>" not in s or "<DEPTH_END>" not in s:
-        raise ValueError(f"Unsupported depth string format: {s[:128]}...")
-    if " " not in s:
-        s = s.replace("><", "> <")
-    return s
-
-
-def serialize_eef_to_tokens(eef_traj):
-    if not isinstance(eef_traj, str):
-        raise TypeError(f"eef_traj must be str, got {type(eef_traj)}")
-    s = eef_traj.strip()
-    try:
-        coords = ast.literal_eval(s)
-    except Exception as exc:
-        raise ValueError(f"Unsupported eef_traj format: {s[:128]}...") from exc
-
-    tokens = ["<EEF_START>"]
-    for point in coords:
-        if not isinstance(point, (list, tuple)) or len(point) != 2:
-            raise ValueError(f"Each eef point must be a pair, got: {point!r}")
-        x, y = point
-        x = int(x)
-        y = int(y)
-        if not (0 <= x <= 255 and 0 <= y <= 255):
-            raise ValueError(f"EEF coordinates out of range [0,255]: {(x, y)}")
-        tokens.append(f"<EEF_X_{x}>")
-        tokens.append(f"<EEF_Y_{y}>")
-    tokens.append("<EEF_END>")
-    return " ".join(tokens)
-
-class LiberoWindowedDataset(Dataset):
+class LiberoWindowedDataset(BaseLiberoWindowedDataset):
     """
     sample:
       images:       (O, 3, 256, 256)
@@ -153,61 +74,53 @@ class LiberoWindowedDataset(Dataset):
     """
 
     def __init__(self, base_ds, horizon=16, obs_horizon=1, normalize_images_01=True, task_map=None):
-        self.base = base_ds
-        self.H = int(horizon)
-        self.O = int(obs_horizon)
-        assert self.H > 0 and self.O > 0
-        self.normalize_images_01 = normalize_images_01
-        
-        # task_map: {task_index(int) -> natural language instruction(str)}
-        self.task_map = task_map
-        assert self.task_map is not None and len(self.task_map) == 40
-        self.task_index_arr = np.asarray(self.base["task_index"], dtype=np.int64)
-
-        eps = self.base["episode_index"]
-        fis = self.base["frame_index"]
-        
-        self.eps = np.asarray(eps, dtype=np.int64)
-        self.fis = np.asarray(fis, dtype=np.int64)
-        
-        assert isinstance(eps[0], (int, np.integer)), f"episode_index type: {type(eps[0])}"
-
-        self.actions = np.asarray(self.base["actions"], dtype=np.float32)  # (N,7)
-        self.state   = np.asarray(self.base["state"], dtype=np.float32)    # (N,8)
+        super().__init__(
+            base_ds=base_ds,
+            horizon=horizon,
+            obs_horizon=obs_horizon,
+            normalize_images_01=normalize_images_01,
+            task_map=task_map,
+        )
         assert "depth" in self.base.column_names and "eef_traj" in self.base.column_names, (
             "Dataset must contain 'depth' and 'eef_traj' columns."
         )
         self.depth = list(self.base["depth"])
         self.eef_traj = list(self.base["eef_traj"])
 
-      
-        def ep_scalar(x):
-            if isinstance(x, (list, tuple)) and len(x) == 1:
-                return int(x[0])
-            try:
-                return int(x)
-            except Exception:
-                return int(x[0])
+    @staticmethod
+    def _serialize_depth_to_tokens(depth_field):
+        if not isinstance(depth_field, str):
+            raise TypeError(f"depth_field must be str, got {type(depth_field)}")
+        s = depth_field.strip()
+        if "<DEPTH_START>" not in s or "<DEPTH_END>" not in s:
+            raise ValueError(f"Unsupported depth string format: {s[:128]}...")
+        if " " not in s:
+            s = s.replace("><", "> <")
+        return s
 
-        episodes = {}
-        for i, e in enumerate(eps):
-            ep = ep_scalar(e)
-            episodes.setdefault(ep, []).append(i)
+    @staticmethod
+    def _serialize_eef_to_tokens(eef_traj):
+        if not isinstance(eef_traj, str):
+            raise TypeError(f"eef_traj must be str, got {type(eef_traj)}")
+        s = eef_traj.strip()
+        try:
+            coords = ast.literal_eval(s)
+        except Exception as exc:
+            raise ValueError(f"Unsupported eef_traj format: {s[:128]}...") from exc
 
-                
-        # t 是 episode 内观测起点；需要 O 帧观测 + H 步未来动作
-        need = self.O + self.H
-        self.windows = []
-        for ep, idxs in episodes.items():
-            L = len(idxs)
-            if L >= need:
-                for t in range(0, L - need + 1):
-                    self.windows.append((idxs, t))
-
-        print(f"[LiberoWindowedDataset] episodes={len(episodes)}, windows={len(self.windows)}")
-
-    def __len__(self):
-        return len(self.windows)
+        tokens = ["<EEF_START>"]
+        for point in coords:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(f"Each eef point must be a pair, got: {point!r}")
+            x, y = point
+            x = int(x)
+            y = int(y)
+            if not (0 <= x <= 255 and 0 <= y <= 255):
+                raise ValueError(f"EEF coordinates out of range [0,255]: {(x, y)}")
+            tokens.append(f"<EEF_X_{x}>")
+            tokens.append(f"<EEF_Y_{y}>")
+        tokens.append("<EEF_END>")
+        return " ".join(tokens)
 
     def __getitem__(self, idx):
         idxs, t = self.windows[idx]
@@ -222,19 +135,10 @@ class LiberoWindowedDataset(Dataset):
             ep0 = self.eps[ids[0]]
             assert np.all(self.eps[ids] == ep0), "cross-episode contamination"
 
-        actions = torch.from_numpy(self.actions[act_ids])              # (H,7)
-        state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
-
-        images = torch.stack([_to_chw_float(self.base[i]["image"], normalize_01=self.normalize_images_01)
-                            for i in obs_ids], dim=0)
-        wrist_images = torch.stack([_to_chw_float(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
-                                    for i in obs_ids], dim=0)
-        sample = {"actions": actions, "state": state0, "image": images, "wrist_image": wrist_images}
-        ti = int(self.task_index_arr[obs_ids[0]])
-        sample["task_text"] = self.task_map[ti]
+        sample = super().__getitem__(idx)
         # Use current observation frame as CoT supervision target to avoid future leakage.
-        sample["depth_text"] = serialize_depth_to_tokens(self.depth[int(obs_ids[0])])
-        sample["eef_text"] = serialize_eef_to_tokens(self.eef_traj[int(obs_ids[0])])
+        sample["depth_text"] = self._serialize_depth_to_tokens(self.depth[int(obs_ids[0])])
+        sample["eef_text"] = self._serialize_eef_to_tokens(self.eef_traj[int(obs_ids[0])])
         
         return sample
 
@@ -256,53 +160,6 @@ def collate_with_task_text(batch):
     out["depth_text"] = depth_text
     out["eef_text"] = eef_text
     return out
-
-
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
-    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    # env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    print('task_bddl_file:', task_bddl_file)
-    # change for libero-plus
-    env_args = {
-        "bddl_file_name": str(task_bddl_file),  # 或 task_bddl_file.as_posix()
-        "camera_heights": resolution,
-        "camera_widths": resolution,
-    }
-
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
-    return env, task_description
-
-
-def _quat2axisangle(quat):
-    """
-    Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
-    """
-    # clip quaternion
-    if quat[3] > 1.0:
-        quat[3] = 1.0
-    elif quat[3] < -1.0:
-        quat[3] = -1.0
-
-    den = np.sqrt(1.0 - quat[3] * quat[3])
-    if math.isclose(den, 0.0):
-        # This is (close to) a zero degree rotation, immediately return
-        return np.zeros(3)
-
-    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
-
-def get_state(obs):
-    state = np.concatenate(
-                    (
-                        obs["robot0_eef_pos"],
-                        _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
-                    ))
-    assert state.shape == (8,) 
-    return state
-
 
 assert torch.cuda.is_available()
 device = 'cuda'
@@ -374,7 +231,6 @@ if args.lambda_force_action_epoch < args.lambda_force_ramp_epoch:
         )
     )
 
-eval_epoch_milestones = [100, 200, 300, 400, 500, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2400, 2600, 2800]
 
 eval_state_dict = None
 if args.eval_cp:
@@ -474,84 +330,14 @@ if args.save_image:
 
 
 # create network object
-vision_encoder = get_resnet('resnet18')
-vision_encoder = replace_bn_with_gn(vision_encoder)
 assert torch.cuda.is_available(), "CUDA is required for bf16 training"
 assert torch.cuda.is_bf16_supported(), "GPU does not support bf16"
-text_encoder = AutoModel.from_pretrained(
-    args.text_model,
-    torch_dtype=torch.bfloat16,
+nets = build_flow_libero_unet_qwen_cot_model(
+    args=args,
+    device=device,
+    action_dim=action_dim,
+    tokenizer=tokenizer,
 )
-text_encoder.resize_token_embeddings(len(tokenizer))
-target_text_encoder = copy.deepcopy(text_encoder)
-
-if not args.frozen_text_model:
-    text_lora_config = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
-        inference_mode=False,
-        r=args.text_lora_r,
-        lora_alpha=args.text_lora_alpha,
-        lora_dropout=args.text_lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    text_encoder = get_peft_model(text_encoder, text_lora_config)
-
-text_embed_dim = int(text_encoder.config.hidden_size)
-
-
-
-per_timestep_obs_dim = 512*2 + 8 + (0 if args.disable_text_input else text_embed_dim  )
-per_timestep_cond_dim = per_timestep_obs_dim + 2 * text_embed_dim  # add predicted depth/eef CoT latents
-if args.net == "ConditionalUnet1D":
-    global_cond_dim = per_timestep_cond_dim * args.obs_horizon
-elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
-    global_cond_dim = per_timestep_cond_dim
-
-if args.net == 'TransformerForDiffusion':
-    noise_pred_net = TransformerForDiffusion(
-        input_dim=action_dim,
-        output_dim=action_dim,
-        horizon=args.pred_horizon,
-        cond_dim=global_cond_dim
-    )
-elif args.net == 'ConditionalUnet1D':
-    noise_pred_net = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=global_cond_dim
-    )
-else:
-    raise ValueError("net not found")
-
-cot_depth_head = nn.Sequential(
-    nn.Linear(per_timestep_obs_dim, per_timestep_obs_dim),
-    nn.SiLU(),
-    nn.Linear(per_timestep_obs_dim, text_embed_dim),
-)
-cot_eef_head = nn.Sequential(
-    nn.Linear(per_timestep_obs_dim, per_timestep_obs_dim),
-    nn.SiLU(),
-    nn.Linear(per_timestep_obs_dim, text_embed_dim),
-)
-
-nets = nn.ModuleDict({
-    'vision_encoder': vision_encoder,
-    'text_encoder': text_encoder,
-    'target_text_encoder': target_text_encoder,
-    'noise_pred_net': noise_pred_net,
-    'cot_depth_head': cot_depth_head,
-    'cot_eef_head': cot_eef_head,
-}).to(device, dtype=torch.bfloat16)
-    
-nets['target_text_encoder'].eval()
-for p in nets['target_text_encoder'].parameters():
-    p.requires_grad = False
-
-if args.frozen_text_model:
-    nets['text_encoder'].eval()
-    for p in nets['text_encoder'].parameters():
-        p.requires_grad = False
-else:
-    nets['text_encoder'].print_trainable_parameters()
         
 ##################################################################
 sigma = 0.0

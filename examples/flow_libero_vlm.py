@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-import sys,random,time,os
+import argparse
+import collections
+import functools
+import imageio
+import os
+import random
+import sys
 sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
@@ -8,57 +14,40 @@ LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
 if LIBERO_ROOT not in sys.path:
     sys.path.append(LIBERO_ROOT)
        
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 from tqdm import tqdm
-from resnet import get_resnet
-from TransformerForDiffusion import TransformerForDiffusion
-from resnet import replace_bn_with_gn
-import collections
 from diffusers.training_utils import EMAModel
 # from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
 from diffusers.optimization import get_scheduler
 from termcolor import colored
-import cv2
-from skvideo.io import vwrite
 from torchcfm.conditional_flow_matching import *
 from torchcfm.utils import *
 from torchcfm.models.models import *
-import pygame,h5py,argparse
-from unet import ConditionalUnet1D
 from peft import (
-    LoraConfig,
-    TaskType,
-    get_peft_model,
     get_peft_model_state_dict,
     set_peft_model_state_dict,
 )
-import transformers
 from transformers import AutoProcessor
 # from utils import *
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModel
 from libero.libero import benchmark
-import pathlib,math,random,imageio,collections,os,sys
 from libero.libero import get_libero_path
 print('bddl files path:', get_libero_path("bddl_files"))
 
-from libero.libero.envs import OffScreenRenderEnv
-import numpy as np
 from PIL import Image
-from torchvision.transforms.functional import pil_to_tensor
-from datasets import load_dataset
+from utils import (_ensure_pil_rgb, 
+            _get_libero_env, _quat2axisangle, collate_with_task_text, get_state, 
+            hf_transform,  LIBERO_ENV_RESOLUTION, LIBERO_DUMMY_ACTION 
+)
+from model_builders import build_flow_libero_vlm_model
 
 benchmark_dict = benchmark.get_benchmark_dict()
-LIBERO_ENV_RESOLUTION = 256
-LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+
 num_steps_wait = 10
 video_out_path: str = "./saved_videos"
 
-import functools
 print = functools.partial(print, flush=True)
 
 # Avoid tokenizer parallelism warnings when DataLoader forks
@@ -66,19 +55,6 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Throughput-oriented defaults for CUDA kernels
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
-
-
-def _to_chw_tensor(img, normalize_01=True):
-    # img may already be torch.uint8 CHW (from HF with_transform)
-    if torch.is_tensor(img):
-        t = img
-    else:
-        t = pil_to_tensor(img.convert("RGB"))
-    if t.dtype != torch.uint8:
-        t = t.to(torch.uint8)
-    if normalize_01:
-        t = t.float() / 255.0
-    return t
 
 def _to_hwc_tensor(img, normalize_01=True):
     # Return CPU HWC tensor for VLM processor path.
@@ -88,7 +64,7 @@ def _to_hwc_tensor(img, normalize_01=True):
         if t.ndim == 3 and t.shape[0] == 3:
             t = t.permute(1, 2, 0).contiguous()
     else:
-        arr = np.array(img.convert("RGB"), dtype=np.uint8, copy=True)
+        arr = np.array(_ensure_pil_rgb(img), dtype=np.uint8, copy=True)
         t = torch.from_numpy(arr)
     if normalize_01:
         if t.dtype == torch.uint8:
@@ -97,23 +73,6 @@ def _to_hwc_tensor(img, normalize_01=True):
     if t.dtype != torch.uint8:
         t = t.clamp(0, 255).to(torch.uint8)
     return t
-
-def hf_transform(ex):
-    # HF 可能传单条：ex["image"] 是 PIL
-    # 也可能传 batch：ex["image"] 是 list[PIL]
-    if "image" in ex:
-        if isinstance(ex["image"], list):
-            ex["image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["image"]]
-        else:
-            ex["image"] = pil_to_tensor(ex["image"].convert("RGB"))
-
-    if "wrist_image" in ex:
-        if isinstance(ex["wrist_image"], list):
-            ex["wrist_image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["wrist_image"]]
-        else:
-            ex["wrist_image"] = pil_to_tensor(ex["wrist_image"].convert("RGB"))
-
-    return ex
 
 class LiberoWindowedDataset(Dataset):
     """
@@ -202,25 +161,11 @@ class LiberoWindowedDataset(Dataset):
         
         return sample
 
-from torch.utils.data._utils.collate import default_collate
-
-def collate_with_task_text(batch):
-    task_text = [b["task_text"] for b in batch]  # 必定存在
-    batch2 = []
-    for b in batch:
-        b = dict(b)
-        b.pop("task_text")
-        batch2.append(b)
-    out = default_collate(batch2)
-    out["task_text"] = task_text
-    return out
-
 def _batch_to_hwc_uint8_np(imgs, normalize_01):
     # Accept [B,O,3,H,W] or [B,O,H,W,3] tensors and convert once.
     t = imgs.detach().to("cpu")
     if t.ndim != 5:
         raise ValueError(f"Unexpected image batch shape: {tuple(t.shape)}")
-    # If already uint8, treat as [0,255] regardless of normalize_01 flag.
     if t.dtype == torch.uint8:
         if t.shape[-1] == 3:
             return t.contiguous().numpy()
@@ -268,7 +213,6 @@ def _extract_pooled_feature(model_out, attention_mask=None):
     raise RuntimeError("Cannot extract pooled feature from VLM output.")
 
 def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=None):
-    # image_pairs: List[List[np.ndarray(H, W, 3), np.ndarray(H, W, 3)]]
     use_chat_template = hasattr(vlm_processor, "apply_chat_template")
     if use_chat_template:
         texts = []
@@ -276,16 +220,14 @@ def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cach
             if prompt_cache is not None and p in prompt_cache:
                 txt = prompt_cache[p]
             else:
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "image"},
-                            {"type": "text", "text": p},
-                        ],
-                    }
-                ]
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "image"},
+                        {"type": "text", "text": p},
+                    ],
+                }]
                 txt = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 if prompt_cache is not None:
                     prompt_cache[p] = txt
@@ -301,11 +243,7 @@ def _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len):
         padding=True,
         truncation=False,
     )
-    # For VLM multi-image prompts, truncation may cut image placeholder tokens
-    # and cause processor-side image token mismatch.
     _ = text_max_len
-
-    # Try several input formats because processor image APIs differ by model/version.
     attempts = [
         dict(proc_kwargs, images=image_pairs),
         dict(proc_kwargs, images=[img for pair in image_pairs for img in pair]),
@@ -317,56 +255,6 @@ def _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len):
         except Exception as e:
             last_err = e
     raise RuntimeError(f"VLM processor input formatting failed. Last error: {last_err}")
-
-def _get_vlm_hidden_size(vlm_encoder):
-    cfg = vlm_encoder.config
-    if hasattr(cfg, "hidden_size"):
-        return int(cfg.hidden_size)
-    for key in ["text_config", "language_config", "llm_config"]:
-        sub_cfg = getattr(cfg, key, None)
-        if sub_cfg is not None and hasattr(sub_cfg, "hidden_size"):
-            return int(sub_cfg.hidden_size)
-    raise RuntimeError("Cannot infer hidden size from VLM config.")
-
-def _from_pretrained_with_loading_info(model_cls, model_name, dtype):
-    # transformers has migrated from torch_dtype -> dtype on newer versions.
-    common = dict(trust_remote_code=True, output_loading_info=True)
-    try:
-        return model_cls.from_pretrained(model_name, dtype=dtype, **common)
-    except TypeError:
-        return model_cls.from_pretrained(model_name, torch_dtype=dtype, **common)
-
-def _load_vlm_encoder(model_name, dtype):
-    # Prefer generation-capable VLM classes first for Qwen VL checkpoints.
-    candidates = [
-        getattr(transformers, "AutoModelForImageTextToText", None),
-        getattr(transformers, "AutoModelForVision2Seq", None),
-        AutoModel,
-    ]
-    last_err = None
-    for cls in candidates:
-        if cls is None:
-            continue
-        try:
-            model, loading_info = _from_pretrained_with_loading_info(cls, model_name, dtype)
-            missing = loading_info.get("missing_keys", []) if isinstance(loading_info, dict) else []
-            if len(missing) > 128:
-                raise RuntimeError(
-                    f"VLM checkpoint appears partially initialized with {len(missing)} missing keys. "
-                    "This usually means an incompatible model class/version was used."
-                )
-            return model
-        except Exception as e:
-            last_err = e
-            continue
-
-    ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
-    if "Qwen3-VL" in model_name and ver < (4, 50):
-        raise RuntimeError(
-            f"{model_name} may require newer transformers than {transformers.__version__}. "
-            f"Please upgrade transformers or use an older VLM checkpoint."
-        ) from last_err
-    raise RuntimeError(f"Failed to load VLM encoder for {model_name}: {last_err}")
 
 def encode_vlm_obs_features(
     vlm_encoder,
@@ -387,65 +275,16 @@ def encode_vlm_obs_features(
         prompt = task_texts[b]
         for o in range(O):
             prompts.append(prompt)
-            img_main = main_imgs_hwc[b, o]
-            img_wrist = wrist_imgs_hwc[b, o]
-            image_pairs.append([img_main, img_wrist])
+            image_pairs.append([main_imgs_hwc[b, o], wrist_imgs_hwc[b, o]])
     texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=prompt_cache)
     vlm_inputs = _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len)
     for k, v in list(vlm_inputs.items()):
         if torch.is_tensor(v):
             vlm_inputs[k] = v.to(device=device, non_blocking=True)
-
     out = vlm_encoder(**vlm_inputs, output_hidden_states=True, return_dict=True)
     pooled = _extract_pooled_feature(out, attention_mask=vlm_inputs.get("attention_mask"))
     pooled = pooled.to(dtype=torch.bfloat16)
     return pooled.view(B, O, -1)
-
-
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
-    task_description = task.language
-    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    # env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    print('task_bddl_file:', task_bddl_file)
-    # change for libero-plus
-    env_args = {
-        "bddl_file_name": str(task_bddl_file),  # 或 task_bddl_file.as_posix()
-        "camera_heights": resolution,
-        "camera_widths": resolution,
-    }
-
-    env = OffScreenRenderEnv(**env_args)
-    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
-    return env, task_description
-
-
-def _quat2axisangle(quat):
-    """
-    Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
-    """
-    # clip quaternion
-    if quat[3] > 1.0:
-        quat[3] = 1.0
-    elif quat[3] < -1.0:
-        quat[3] = -1.0
-
-    den = np.sqrt(1.0 - quat[3] * quat[3])
-    if math.isclose(den, 0.0):
-        # This is (close to) a zero degree rotation, immediately return
-        return np.zeros(3)
-
-    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
-
-def get_state(obs):
-    state = np.concatenate(
-                    (
-                        obs["robot0_eef_pos"],
-                        _quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
-                    ))
-    assert state.shape == (8,) 
-    return state
 
 assert torch.cuda.is_available()
 device = 'cuda'
@@ -468,7 +307,6 @@ parser.add_argument("--vlm_lora_alpha", type=int, default=32)
 parser.add_argument("--vlm_lora_dropout", type=float, default=0.0)
 parser.add_argument("--text_max_len", type=int, default=64)
 parser.add_argument("--frozen_vlm", action="store_true") ###
-parser.add_argument("--eval", action='store_true')
 parser.add_argument("--save_image", action='store_true')
 parser.add_argument("--save_video", action='store_true')
 parser.add_argument("--eval_cp", type=str, default=None)
@@ -477,8 +315,7 @@ parser.add_argument("--video_name", type=str, default="")
 args = parser.parse_args() 
 print('args:', args)
 eval_state_dict = None
-if args.eval:
-    assert args.eval_cp is not None
+if args.eval_cp:
     eval_state_dict = torch.load(args.eval_cp, map_location='cpu')
  
 ##################################
@@ -499,6 +336,7 @@ task_map = {row["task_index"]: row["task"] for row in meta}
 task_texts = [task_map[i] for i in sorted(task_map.keys())]
 vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
 vlm_prompt_cache = {}
+base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
                            horizon=args.pred_horizon, 
                            obs_horizon=args.obs_horizon, 
@@ -525,7 +363,6 @@ print('state:', batch["state"].shape)         # torch.Size([64, 1, 8])
 print('image:', batch["image"].shape)         # torch.Size([64, 1, 256, 256, 3])
 print('wrist_image:', batch["wrist_image"].shape)   # torch.Size([64, 1, 256, 256, 3])
 print('task_text:', len(batch['task_text']))
-print('image dtype:', batch["image"].dtype, 'wrist_image dtype:', batch["wrist_image"].dtype)
 assert isinstance(batch["task_text"], list)
 # for tt in batch['task_text']:
 #     print(tt)
@@ -534,6 +371,7 @@ assert isinstance(batch["task_text"], list)
 # os._exit(0)
 
 if args.save_image:
+    os.makedirs('./saved_images', exist_ok=True)
     imgs = batch["image"]   # shape: [B, O, H, W, 3]
     B, O, H, W, C = imgs.shape
     N = 5
@@ -554,58 +392,16 @@ if args.save_image:
 assert torch.cuda.is_available(), "CUDA is required for bf16 training"
 assert torch.cuda.is_bf16_supported(), "GPU does not support bf16"
 # create network object
-vlm_encoder_model = _load_vlm_encoder(args.vlm_model, dtype=torch.bfloat16)
-vlm_encoder_model = vlm_encoder_model.to(device, dtype=torch.bfloat16)
-use_vlm_lora = (not args.eval and not args.frozen_vlm) or (
-    args.eval and eval_state_dict is not None and 'vlm_encoder_lora' in eval_state_dict
+nets, use_vlm_lora = build_flow_libero_vlm_model(
+    args=args,
+    device=device,
+    action_dim=action_dim,
+    eval_state_dict=eval_state_dict,
 )
-if use_vlm_lora:
-    vlm_lora_config = LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION,
-        inference_mode=False,
-        r=args.vlm_lora_r,
-        lora_alpha=args.vlm_lora_alpha,
-        lora_dropout=args.vlm_lora_dropout,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    )
-    vlm_encoder_model = get_peft_model(vlm_encoder_model, vlm_lora_config)
-vlm_embed_dim = _get_vlm_hidden_size(vlm_encoder_model)
-per_timestep_cond_dim = vlm_embed_dim + 8
-
-if args.net == "ConditionalUnet1D":
-    global_cond_dim = per_timestep_cond_dim * args.obs_horizon
-elif args.net == "TransformerForDiffusion":  # Transformer cond 是按 timestep 给的
-    global_cond_dim = per_timestep_cond_dim
-
-if args.net == 'TransformerForDiffusion':
-    noise_pred_net = TransformerForDiffusion(
-        input_dim=action_dim,
-        output_dim=action_dim,
-        horizon=args.pred_horizon,
-        cond_dim=global_cond_dim
-    )
-elif args.net == 'ConditionalUnet1D':
-    noise_pred_net = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=global_cond_dim
-    )
-else:
-    raise ValueError("net not found")
-
-nets = nn.ModuleDict({'noise_pred_net': noise_pred_net}).to(device, dtype=torch.bfloat16)
-
-if args.frozen_vlm:
-    vlm_encoder_model.eval()
-    for p in vlm_encoder_model.parameters():
-        p.requires_grad = False
-elif use_vlm_lora and hasattr(vlm_encoder_model, "print_trainable_parameters"):
-    vlm_encoder_model.print_trainable_parameters()
         
 ##################################################################
 sigma = 0.0
-trainable_params = list(nets.parameters()) + list(vlm_encoder_model.parameters())
-ema_params = [p for p in trainable_params if p.requires_grad]
-ema = EMAModel(parameters=ema_params, power=0.75)
+ema_params = [p for p in nets.parameters() if p.requires_grad]
 optimizer = torch.optim.AdamW(params=ema_params, lr=1e-4,weight_decay=1e-6)
 
 # optimizer = torch.optim.AdamW(params=nets.parameters(), lr=1e-4, weight_decay=1e-6)
@@ -621,16 +417,14 @@ print('model initialized')
 
         
 #### Train the model
-if not args.eval:
+if not args.eval_cp:
     for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
         total_loss_train = 0.0
         
         nets.train()
         if args.frozen_vlm:
-            vlm_encoder_model.eval()
-        else:
-            vlm_encoder_model.train()
+            nets['vlm_encoder'].eval()
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="it", leave=False, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_noinv_fmt}{postfix}]")
         optimizer.zero_grad(set_to_none=True)
@@ -685,7 +479,7 @@ if not args.eval:
             if args.frozen_vlm:
                 with torch.inference_mode():
                     vlm_feat = encode_vlm_obs_features(
-                        vlm_encoder=vlm_encoder_model,
+                        vlm_encoder=nets['vlm_encoder'],
                         vlm_processor=vlm_processor,
                         x_main_img=x_main_img,
                         x_wrist_image=x_wrist_image,
@@ -697,7 +491,7 @@ if not args.eval:
                     )
             else:
                 vlm_feat = encode_vlm_obs_features(
-                    vlm_encoder=vlm_encoder_model,
+                    vlm_encoder=nets['vlm_encoder'],
                     vlm_processor=vlm_processor,
                     x_main_img=x_main_img,
                     x_wrist_image=x_wrist_image,
@@ -747,9 +541,6 @@ if not args.eval:
             optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
 
-            # update Exponential Moving Average of the model weights
-            # ema.step(nets.parameters())
-            ema.step(ema_params)
             
             if args.debug and ii >= 8 :
                 break
@@ -762,23 +553,20 @@ if not args.eval:
         if (epoch > 0 and epoch % args.save_interval  == 0 and args.cp_name) or args.debug :
             cp_save_path = "./checkpoints/libero/vlm/"
             os.makedirs(cp_save_path, exist_ok=True)
-            ema.store(ema_params) 
-            ema.copy_to(ema_params)
 
             if  args.debug :
                 epoch = 'debug'
                 
             ckpt = {
                 'noise_pred_net': nets['noise_pred_net'].state_dict(),
-                'vlm_encoder_lora': get_peft_model_state_dict(vlm_encoder_model),
                 'epoch': epoch,
-                'ema': ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 "args": vars(args),
             }
+            if not args.frozen_vlm:
+                ckpt['vlm_encoder_lora'] = get_peft_model_state_dict(nets['vlm_encoder'])
             torch.save(ckpt, f'{cp_save_path}/cp-{args.net}-{args.cp_name}-{epoch}.pth')
-            ema.restore(ema_params)    
 
         if args.debug:
             break
@@ -793,15 +581,15 @@ else:
     if 'vlm_encoder_lora' in state_dict:
         if not use_vlm_lora:
             raise RuntimeError("Checkpoint contains LoRA weights but VLM LoRA was not initialized.")
-        set_peft_model_state_dict(vlm_encoder_model, state_dict['vlm_encoder_lora'])
+        set_peft_model_state_dict(nets['vlm_encoder'], state_dict['vlm_encoder_lora'])
     elif 'vlm_encoder' in state_dict:
-        vlm_encoder_model.load_state_dict(state_dict['vlm_encoder'])
-    else:
+        nets['vlm_encoder'].load_state_dict(state_dict['vlm_encoder'])
+    elif not args.frozen_vlm:
         raise KeyError("Checkpoint missing key 'vlm_encoder_lora' or 'vlm_encoder'")
     nets['noise_pred_net'].load_state_dict(state_dict['noise_pred_net'])
     print('load checkpoint success')    
     
-    vlm_encoder_model.eval()
+    nets['vlm_encoder'].eval()
 
     for task_suite_name in benchmark_dict.keys():
 
@@ -930,7 +718,7 @@ else:
                     assert x_pos.shape == (B, args.obs_horizon, 8)
                     with torch.no_grad():
                         vlm_feat = encode_vlm_obs_features(
-                            vlm_encoder=vlm_encoder_model,
+                            vlm_encoder=nets['vlm_encoder'],
                             vlm_processor=vlm_processor,
                             x_main_img=x_main_img,
                             x_wrist_image=x_wrist_image,
