@@ -267,7 +267,7 @@ FM = ConditionalFlowMatcher(sigma=sigma)
 print('model initialized')
 
         
-if not args.eval_cp
+if not args.eval_cp:
     #### Train the model
     for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
