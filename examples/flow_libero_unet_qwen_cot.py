@@ -50,6 +50,7 @@ print('bddl files path:', get_libero_path("bddl_files"))
 from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from PIL import Image
+import io
 from torchvision.transforms.functional import pil_to_tensor
 from datasets import load_dataset
 
@@ -66,31 +67,43 @@ print = functools.partial(print, flush=True)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
+def _ensure_pil_rgb(img):
+    if isinstance(img, Image.Image):
+        return img.convert("RGB")
+    if torch.is_tensor(img):
+        return img
+    if isinstance(img, dict):
+        if img.get("bytes") is not None:
+            return Image.open(io.BytesIO(img["bytes"])).convert("RGB")
+        if img.get("path") is not None:
+            return Image.open(img["path"]).convert("RGB")
+    raise TypeError(f"Unsupported image type: {type(img)}")
+
+
 def _to_chw_float(img, normalize_01=True):
     # img 可能已经是 torch.uint8 CHW（来自 with_transform）
     if torch.is_tensor(img):
         t = img
     else:
-        t = pil_to_tensor(img.convert("RGB"))
+        t = pil_to_tensor(_ensure_pil_rgb(img))
     t = t.float()
     if normalize_01:
         t = t / 255.0
     return t
 
 def hf_transform(ex):
-    # HF 可能传单条：ex["image"] 是 PIL
-    # 也可能传 batch：ex["image"] 是 list[PIL]
+    # HF 可能传单条 / batch；元素可能是 PIL，也可能是 {"bytes","path"} 字典
     if "image" in ex:
         if isinstance(ex["image"], list):
-            ex["image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["image"]]
+            ex["image"] = [pil_to_tensor(_ensure_pil_rgb(im)) for im in ex["image"]]
         else:
-            ex["image"] = pil_to_tensor(ex["image"].convert("RGB"))
+            ex["image"] = pil_to_tensor(_ensure_pil_rgb(ex["image"]))
 
     if "wrist_image" in ex:
         if isinstance(ex["wrist_image"], list):
-            ex["wrist_image"] = [pil_to_tensor(im.convert("RGB")) for im in ex["wrist_image"]]
+            ex["wrist_image"] = [pil_to_tensor(_ensure_pil_rgb(im)) for im in ex["wrist_image"]]
         else:
-            ex["wrist_image"] = pil_to_tensor(ex["wrist_image"].convert("RGB"))
+            ex["wrist_image"] = pil_to_tensor(_ensure_pil_rgb(ex["wrist_image"]))
 
     return ex
 
