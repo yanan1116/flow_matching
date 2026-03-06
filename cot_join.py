@@ -202,7 +202,7 @@ def main() -> None:
             joined_eef.append(payload.eef_traj)
 
     print(f"unmatched: {unmatched}", unmatched / len(ds_libero))
-    print( "missed_task_episode_index:", len(missed_task_episode_index), len(missed_task_episode_index) / len(ds_libero) )
+    print( "missed_task_episode_index:", len(missed_task_episode_index) )
 
     assert len(joined_depth) == len(ds_libero)
     assert len(joined_eef) == len(ds_libero)
@@ -212,7 +212,7 @@ def main() -> None:
     ds_libero_filter = ds_libero.filter(lambda ex: f"{ex['task_index']}-{ex['episode_index']}" not in missed_task_episode_index)
     # ds_libero_filter = ds_libero.filter(lambda ex: ex['depth'] != '' and ex['eef_traj'] != '')
     print('ds_libero_filter:', ds_libero_filter.num_rows / ds_libero.num_rows)
-    print("ds_libero_filter has blank cot:", ds_libero_filter.filter(lambda ex: ex['depth'] == '' or  ex['eef_traj'] == '').num_rows)
+    assert ds_libero_filter.filter(lambda ex: ex['depth'] == '' or  ex['eef_traj'] == '').num_rows == 0, " ds_libero_filter should have no blank cot cols"
     # ds_libero_sample = ds_libero_filter.select(range(10000))
 
     ds_libero_filter.push_to_hub(

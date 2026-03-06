@@ -446,10 +446,6 @@ print('model initialized')
 #### Train the model
 for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
 
-    if args.eval_cp or (args.debug and epoch > 3 )  :
-        print('debug or test mode')
-        os._exit(0)
-
     total_loss_train = 0.0
     
     nets.train()
@@ -606,7 +602,6 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         avg_loss_train = total_loss_train / len(dataloader)
         print(colored(f"epoch: {epoch},  loss_train: {avg_loss_train:.6f}", 'yellow'))    
         
-    
 
     if args.save_cp and epoch in eval_epoch_milestones: # save checkpint at some intervals
         cp_save_path = "./checkpoints/libero/unet_qwen/"
@@ -973,3 +968,6 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
             ema.restore(ema_params)
     
     
+    if args.eval_cp or (args.debug and epoch > 3 )  :
+        print('debug or test mode')
+        os._exit(0)
