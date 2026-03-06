@@ -316,7 +316,6 @@ parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--prefetch_factor", type=int, default=2)
 parser.add_argument("--disable_text_input", action='store_true')
 parser.add_argument("--dataset_repo", type=str, default="yananchen/libero_cot_contious")
-parser.add_argument("--meta_repo", type=str, default="physical-intelligence/libero")
 
 parser.add_argument("--lambda_fm_start", type=float, default=0.1)
 parser.add_argument("--lambda_fm_end", type=float, default=1.0)
@@ -368,19 +367,12 @@ print(type(base_ds[0]["image"]))
 task_indices = base_ds['task_index']
 assert len(set(task_indices)) == 40 and min(task_indices) == 0 and max(task_indices) == 39
 
-try:
-    meta = load_dataset(
-        hf_dataset_repo,
-        data_files="meta/tasks.jsonl",
-        split="train",
-    )
-except Exception:
-    print(f"meta/tasks.jsonl not found in {hf_dataset_repo}, fallback to {args.meta_repo}")
-    meta = load_dataset(
-        args.meta_repo,
-        data_files="meta/tasks.jsonl",
-        split="train",
-    )
+
+meta = load_dataset(
+    "physical-intelligence/libero",
+    data_files="meta/tasks.jsonl",
+    split="train",
+)
 task_map = {row["task_index"]: row["task"] for row in meta}
 task_texts = [task_map[i] for i in sorted(task_map.keys())]
 tokenizer = AutoTokenizer.from_pretrained(args.text_model, use_fast=True)
