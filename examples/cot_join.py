@@ -145,7 +145,7 @@ def main() -> None:
         path=args.libero_repo,
         split='train',
     )
-    # ds_libero = ds_libero.shuffle().select(range(10000))
+
     ds_libero = ds_libero.map(add_instruction, num_proc=16, desc='add instruction')
     ds_libero = ensure_decode_false(ds_libero, args.libero_image_col)
     ds_libero = ensure_decode_false(ds_libero, args.libero_wrist_col)
