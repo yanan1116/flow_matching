@@ -191,7 +191,6 @@ parser.add_argument("--save_cp", action='store_true')
 parser.add_argument("--eval_cp", type=str, default=None)
 parser.add_argument("--video_name", type=str, default="")
 parser.add_argument("--cp_name", type=str, default='')
-parser.add_argument("--eval_realtime", action="store_true")
 parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--prefetch_factor", type=int, default=2)
 parser.add_argument("--disable_text_input", action='store_true')
@@ -216,8 +215,6 @@ parser.add_argument("--lambda_min_cot_drop", type=float, default=0.2)
 parser.add_argument("--lambda_force_ramp_epoch", type=int, default=240)
 parser.add_argument("--lambda_force_action_epoch", type=int, default=360)
 args = parser.parse_args() 
-if args.eval_cp and args.eval_realtime:
-    raise ValueError("--eval_cp and --eval_realtime cannot be used together")
 
 if args.disable_text_input:
     assert args.frozen_text_model , 'when disable_text_input, text model should be frozen'
@@ -689,7 +686,7 @@ for epoch in tqdm(range( args.num_epochs ), desc="Training Epochs"):
         torch.save(ckpt, f'{cp_save_path}/cp-{args.cp_name}-{epoch}.pth')
 
     # do evaluation below - inference
-    if  args.debug or args.eval_cp or (args.eval_realtime and epoch in eval_epoch_milestones):
+    if  args.debug or args.eval_cp :
         if args.eval_cp: # if eval_cp is not none, then load the checkpoint
             nets.eval()
             state_dict = eval_state_dict
