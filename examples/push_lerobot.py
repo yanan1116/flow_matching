@@ -1,7 +1,7 @@
 import h5py,sys,math,random,os,argparse,tyro,glob,shutil,time,os
 import numpy as np
 from PIL import Image
-from utils import *
+
 
 import lerobot;print('lerobot ver:', lerobot.__version__, lerobot.__file__)
 if lerobot.__version__ == "0.1.0":
@@ -13,7 +13,38 @@ else:
     from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+def quat2axisangle(quat):
+    """
+    Converts quaternion to axis-angle format.
+    Returns a unit vector direction scaled by its angle in radians.
 
+    Args:
+        quat (np.array): (x,y,z,w) vec4 float angles
+
+    Returns:
+        np.array: (ax,ay,az) axis-angle exponential coordinates
+    """
+    # clip quaternion
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        # This is (close to) a zero degree rotation, immediately return
+        return np.zeros(3)
+
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+def compute_ee_state(robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos):
+    return np.hstack(
+                        (
+                            robot0_eef_pos, # dim 3
+                            quat2axisangle(robot0_eef_quat), # input dim 4 -- > output dim 3
+                            robot0_gripper_qpos # dim 2
+                        )
+                    )
 
 parser = argparse.ArgumentParser()
 
@@ -289,8 +320,14 @@ elif 'robocasa' in args.repo:
     hdf5_files = hdf5_files_multi_stage + hdf5_files_single_stage
     random.shuffle(hdf5_files)
 
-    for file in hdf5_files:
+    for file in hdf5_files[:1]:
         assert os.path.exists(file), f"File not found: {file}"
+        
+        task = file.split('/2024')[0].split('/')[-1]
+        if task in pnp_to_pickplace:
+            task = pnp_to_pickplace[task]
+        assert task in task_to_description
+        
         with h5py.File(file, "r") as f:    
             # data:
             #    demo_0
@@ -319,19 +356,26 @@ elif 'robocasa' in args.repo:
                 for k, v in traj['obs'].items():
                     assert v.shape[0] == traj['actions'].shape[0]
 
+                agentview_images = traj['obs']['robot0_agentview_right_image'][()]
+                wrist_images = traj['obs']['robot0_eye_in_hand_image'][()]
+                robot0_eef_pos_all = traj['obs']['robot0_eef_pos'][()]
+                robot0_eef_quat_all = traj['obs']['robot0_eef_quat'][()]
+                robot0_gripper_qpos_all = traj['obs']['robot0_gripper_qpos'][()]
+                actions_all = traj['actions'][()]
+
                 for step_ix in range(traj['actions'].shape[0]):
                     
                     # frontview_image = traj['obs']['frontview_image'][()][step_ix]
-                    agentview_image = traj['obs']['robot0_agentview_right_image'][()][step_ix]
-                    robot0_eye_in_hand_image = traj['obs']['robot0_eye_in_hand_image'][()][step_ix]
+                    agentview_image = agentview_images[step_ix]
+                    robot0_eye_in_hand_image = wrist_images[step_ix]
                     
-                    robot0_eef_pos = traj['obs']['robot0_eef_pos'][step_ix]
-                    robot0_eef_quat = traj['obs']['robot0_eef_quat'][step_ix]
-                    robot0_gripper_qpos = traj['obs']['robot0_gripper_qpos'][step_ix]
+                    robot0_eef_pos = robot0_eef_pos_all[step_ix]
+                    robot0_eef_quat = robot0_eef_quat_all[step_ix]
+                    robot0_gripper_qpos = robot0_gripper_qpos_all[step_ix]
                     
                     ee_state = compute_ee_state(robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos) 
 
-                    action = traj['actions'][()][step_ix]
+                    action = actions_all[step_ix]
                     
                     assert \
                         isinstance(agentview_image, np.ndarray) and \
@@ -344,10 +388,7 @@ elif 'robocasa' in args.repo:
                     assert agentview_image.shape == image_shape == robot0_eye_in_hand_image.shape
                     # print(ee_state.shape)
                     # print(action.shape)
-                    task = file.split('/2024')[0].split('/')[-1]
-                    if task in pnp_to_pickplace:
-                        task = pnp_to_pickplace[task]
-                    assert task in task_to_description
+
                     
                     dataset.add_frame(
                         {
@@ -602,5 +643,4 @@ if args.push:
         push_videos=True,
         license="apache-2.0",
     )
-
 
