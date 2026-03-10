@@ -56,23 +56,18 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
-def _to_hwc_tensor(img, normalize_01=True):
-    # Return CPU HWC tensor for VLM processor path.
-    # normalize_01=True -> float in [0,1]; False -> uint8 in [0,255].
+def _to_hwc_uint8_tensor(img):
+    # Return CPU HWC uint8 tensor for the VLM processor path.
     if torch.is_tensor(img):
         t = img
         if t.ndim == 3 and t.shape[0] == 3:
             t = t.permute(1, 2, 0).contiguous()
+        if t.dtype != torch.uint8:
+            t = t.clamp(0, 255).to(torch.uint8)
+        return t
     else:
         arr = np.array(_ensure_pil_rgb(img), dtype=np.uint8, copy=True)
-        t = torch.from_numpy(arr)
-    if normalize_01:
-        if t.dtype == torch.uint8:
-            return t.float() / 255.0
-        return t.to(torch.float32).clamp(0, 1)
-    if t.dtype != torch.uint8:
-        t = t.clamp(0, 255).to(torch.uint8)
-    return t
+        return torch.from_numpy(arr)
 
 class LiberoWindowedDataset(Dataset):
     """
@@ -88,7 +83,7 @@ class LiberoWindowedDataset(Dataset):
         self.H = int(horizon)
         self.O = int(obs_horizon)
         assert self.H > 0 and self.O > 0
-        self.normalize_images_01 = normalize_images_01
+        _ = normalize_images_01
         
         # task_map: {task_index(int) -> natural language instruction(str)}
         self.task_map = task_map
@@ -151,9 +146,9 @@ class LiberoWindowedDataset(Dataset):
         actions = torch.from_numpy(self.actions[act_ids])              # (H,7)
         state0  = torch.from_numpy(self.state[obs_ids[0]]).view(1, -1) # (1,8)
 
-        images = torch.stack([_to_hwc_tensor(self.base[i]["image"], normalize_01=self.normalize_images_01)
+        images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["image"])
                               for i in obs_ids], dim=0)
-        wrist_images = torch.stack([_to_hwc_tensor(self.base[i]["wrist_image"], normalize_01=self.normalize_images_01)
+        wrist_images = torch.stack([_to_hwc_uint8_tensor(self.base[i]["wrist_image"])
                                     for i in obs_ids], dim=0)
         sample = {"actions": actions, "state": state0, "image": images, "wrist_image": wrist_images}
         ti = int(self.task_index_arr[obs_ids[0]])
@@ -161,25 +156,41 @@ class LiberoWindowedDataset(Dataset):
         
         return sample
 
-def _batch_to_hwc_uint8_np(imgs, normalize_01):
-    # Accept [B,O,3,H,W] or [B,O,H,W,3] tensors and convert once.
-    t = imgs.detach().to("cpu")
+def _batch_to_hwc_uint8_np(imgs):
+    # Accept CPU uint8 image tensors in [B,O,H,W,3] or [B,O,3,H,W] form.
+    t = imgs
     if t.ndim != 5:
         raise ValueError(f"Unexpected image batch shape: {tuple(t.shape)}")
-    if t.dtype == torch.uint8:
-        if t.shape[-1] == 3:
-            return t.contiguous().numpy()
-        return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
-    if t.dtype in (torch.bfloat16, torch.float16):
-        t = t.to(torch.float32)
-    if normalize_01:
-        t = (t.clamp(0, 1) * 255.0).round()
-    else:
-        t = t.clamp(0, 255)
-    t = t.to(torch.uint8)
+    if t.device.type != "cpu":
+        t = t.cpu()
+    if t.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 images for VLM path, got {t.dtype}")
     if t.shape[-1] == 3:
         return t.contiguous().numpy()
     return t.permute(0, 1, 3, 4, 2).contiguous().numpy()
+
+
+def _build_task_prompt_map(vlm_processor, task_texts):
+    use_chat_template = hasattr(vlm_processor, "apply_chat_template")
+    if not use_chat_template:
+        return {task_text: task_text for task_text in task_texts}
+
+    prompt_map = {}
+    for task_text in task_texts:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "image"},
+                {"type": "text", "text": task_text},
+            ],
+        }]
+        prompt_map[task_text] = vlm_processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    return prompt_map
 
 def _extract_pooled_feature(model_out, attention_mask=None):
     if hasattr(model_out, "pooler_output") and model_out.pooler_output is not None:
@@ -212,30 +223,6 @@ def _extract_pooled_feature(model_out, attention_mask=None):
 
     raise RuntimeError("Cannot extract pooled feature from VLM output.")
 
-def _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=None):
-    use_chat_template = hasattr(vlm_processor, "apply_chat_template")
-    if use_chat_template:
-        texts = []
-        for p in prompts:
-            if prompt_cache is not None and p in prompt_cache:
-                txt = prompt_cache[p]
-            else:
-                messages = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "image"},
-                        {"type": "text", "text": p},
-                    ],
-                }]
-                txt = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                if prompt_cache is not None:
-                    prompt_cache[p] = txt
-            texts.append(txt)
-    else:
-        texts = prompts
-    return texts, image_pairs
-
 def _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len):
     proc_kwargs = dict(
         text=texts,
@@ -262,22 +249,20 @@ def encode_vlm_obs_features(
     x_main_img,
     x_wrist_image,
     task_texts,
-    normalize_images_01,
     text_max_len,
     device,
-    prompt_cache=None,):
+    task_prompt_map,):
     B, O = x_main_img.shape[:2]
-    main_imgs_hwc = _batch_to_hwc_uint8_np(x_main_img, normalize_images_01)
-    wrist_imgs_hwc = _batch_to_hwc_uint8_np(x_wrist_image, normalize_images_01)
+    main_imgs_hwc = _batch_to_hwc_uint8_np(x_main_img)
+    wrist_imgs_hwc = _batch_to_hwc_uint8_np(x_wrist_image)
     prompts = []
     image_pairs = []
     for b in range(B):
-        prompt = task_texts[b]
+        prompt = task_prompt_map[task_texts[b]]
         for o in range(O):
             prompts.append(prompt)
             image_pairs.append([main_imgs_hwc[b, o], wrist_imgs_hwc[b, o]])
-    texts, image_pairs = _build_vlm_texts_and_images(vlm_processor, prompts, image_pairs, prompt_cache=prompt_cache)
-    vlm_inputs = _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len)
+    vlm_inputs = _processor_call_compat(vlm_processor, prompts, image_pairs, text_max_len)
     for k, v in list(vlm_inputs.items()):
         if torch.is_tensor(v):
             vlm_inputs[k] = v.to(device=device, non_blocking=True)
@@ -335,7 +320,7 @@ meta = load_dataset(
 task_map = {row["task_index"]: row["task"] for row in meta}
 task_texts = [task_map[i] for i in sorted(task_map.keys())]
 vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
-vlm_prompt_cache = {}
+task_prompt_map = _build_task_prompt_map(vlm_processor, task_texts)
 base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
                            horizon=args.pred_horizon, 
@@ -381,10 +366,7 @@ if args.save_image:
         if torch.is_tensor(img):
             img = img.cpu().numpy()
         if img.dtype != np.uint8:
-            if args.normalize_images_01:
-                img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
-            else:
-                img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+            img = np.clip(img, 0.0, 255.0).astype(np.uint8)
         Image.fromarray(img).save(f"saved_images/libero_hf_image_{i}.png")
 # images are in normal orientation
 
@@ -433,13 +415,9 @@ if not args.eval_cp:
             if args.debug:
                 batch_wrist_image_min, batch_wrist_image_max = batch['wrist_image'].min().item(), batch['wrist_image'].max().item()
                 batch_main_image_min, batch_main_image_max = batch['image'].min().item(), batch['image'].max().item()
-
-                if args.normalize_images_01:
-                    assert batch_wrist_image_min >= 0 and batch_wrist_image_max <= 1, 'wrist_image range error'
-                    assert batch_main_image_min >= 0 and batch_main_image_max <= 1, 'image range error'
-                else:
-                    assert batch_wrist_image_min >= 0 and ( 1 <= batch_wrist_image_max <= 255), 'wrist_image range error'
-                    assert batch_main_image_min >= 0 and ( 1 <= batch_main_image_max <= 255), 'image range error'
+                assert batch['wrist_image'].dtype == torch.uint8 and batch['image'].dtype == torch.uint8
+                assert batch_wrist_image_min >= 0 and (1 <= batch_wrist_image_max <= 255), 'wrist_image range error'
+                assert batch_main_image_min >= 0 and (1 <= batch_main_image_max <= 255), 'image range error'
                 
                 assert batch['actions'].min() >= -1 and batch['actions'].max() <= 1, 'actions range error'
             
@@ -482,13 +460,12 @@ if not args.eval_cp:
                         vlm_encoder=nets['vlm_encoder'],
                         vlm_processor=vlm_processor,
                         x_main_img=x_main_img,
-                        x_wrist_image=x_wrist_image,
-                        task_texts=batch["task_text"],
-                        normalize_images_01=args.normalize_images_01,
-                        text_max_len=args.text_max_len,
-                        device=device,
-                        prompt_cache=vlm_prompt_cache,
-                    )
+                    x_wrist_image=x_wrist_image,
+                    task_texts=batch["task_text"],
+                    text_max_len=args.text_max_len,
+                    device=device,
+                    task_prompt_map=task_prompt_map,
+                )
             else:
                 vlm_feat = encode_vlm_obs_features(
                     vlm_encoder=nets['vlm_encoder'],
@@ -496,10 +473,9 @@ if not args.eval_cp:
                     x_main_img=x_main_img,
                     x_wrist_image=x_wrist_image,
                     task_texts=batch["task_text"],
-                    normalize_images_01=args.normalize_images_01,
                     text_max_len=args.text_max_len,
                     device=device,
-                    prompt_cache=vlm_prompt_cache,
+                    task_prompt_map=task_prompt_map,
                 )
             if vlm_feat.device != x_pos.device:
                 vlm_feat = vlm_feat.to(device=x_pos.device, non_blocking=True)
@@ -681,19 +657,19 @@ else:
                     
                     x_main_img = np.stack([
                         np.ascontiguousarray(
-                            x["agentview_image"][::-1, ::-1, :].transpose(2,0,1) # IMPORTANT: rotate 180 degrees to match train preprocessing
+                            x["agentview_image"][::-1, ::-1, :] # IMPORTANT: rotate 180 degrees to match train preprocessing
                         )
                         for x in obs_deque
-                    ], axis=0)# (O,3,256,256)
-                    x_main_img = x_main_img[None]   # (1,O,3,256,256)
+                    ], axis=0) # (O,256,256,3)
+                    x_main_img = x_main_img[None]   # (1,O,256,256,3)
                     
                     x_wrist_image = np.stack([
                         np.ascontiguousarray(
-                            x["robot0_eye_in_hand_image"][::-1, ::-1, :].transpose(2,0,1) # IMPORTANT: rotate 180 degrees to match train preprocessing
+                            x["robot0_eye_in_hand_image"][::-1, ::-1, :] # IMPORTANT: rotate 180 degrees to match train preprocessing
                         )
                         for x in obs_deque
-                    ], axis=0)   # (O,3,256,256)                    
-                    x_wrist_image = x_wrist_image[None] # (1,O,3,256,256)
+                    ], axis=0)   # (O,256,256,3)
+                    x_wrist_image = x_wrist_image[None] # (1,O,256,256,3)
 
                     x_pos = np.stack([get_state(x) for x in obs_deque])[None, ...]
                     
@@ -703,18 +679,14 @@ else:
                     # print('infer x_wrist_image:', x_wrist_image.shape)
                     # print('infer x_pos:', x_pos.shape)
                     
-                    if args.normalize_images_01:
-                        x_main_img = x_main_img.astype(np.float32) / 255.0
-                        x_wrist_image = x_wrist_image.astype(np.float32) / 255.0
-                                            
-                    x_main_img = torch.from_numpy(x_main_img).to(device, dtype=torch.bfloat16)
-                    x_wrist_image = torch.from_numpy(x_wrist_image).to(device, dtype=torch.bfloat16)
+                    x_main_img = torch.from_numpy(x_main_img)
+                    x_wrist_image = torch.from_numpy(x_wrist_image)
                     x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.bfloat16)
                     if args.debug:
-                        assert x_main_img.dtype == torch.bfloat16 and x_wrist_image.dtype == torch.bfloat16
+                        assert x_main_img.dtype == torch.uint8 and x_wrist_image.dtype == torch.uint8
                         assert x_pos.dtype == torch.bfloat16
 
-                    assert x_main_img.shape == (B, args.obs_horizon, 3, 256, 256) == x_wrist_image.shape
+                    assert x_main_img.shape == (B, args.obs_horizon, 256, 256, 3) == x_wrist_image.shape
                     assert x_pos.shape == (B, args.obs_horizon, 8)
                     with torch.no_grad():
                         vlm_feat = encode_vlm_obs_features(
@@ -723,10 +695,9 @@ else:
                             x_main_img=x_main_img,
                             x_wrist_image=x_wrist_image,
                             task_texts=[task_description],
-                            normalize_images_01=args.normalize_images_01,
                             text_max_len=args.text_max_len,
                             device=device,
-                            prompt_cache=vlm_prompt_cache,
+                            task_prompt_map=task_prompt_map,
                         )
                         if vlm_feat.device != x_pos.device:
                             vlm_feat = vlm_feat.to(device=x_pos.device, non_blocking=True)
