@@ -113,7 +113,7 @@ def build_flow_libero_vlm_model(args, device, action_dim, eval_state_dict=None):
     else:
         nets["vlm_encoder"].print_trainable_parameters()
 
-    return nets, use_vlm_lora
+    return nets
 
 
 def build_flow_libero_unet_qwen_cot_model(args, device, action_dim, tokenizer):

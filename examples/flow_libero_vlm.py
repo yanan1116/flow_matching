@@ -392,7 +392,7 @@ if args.save_image:
 assert torch.cuda.is_available(), "CUDA is required for bf16 training"
 assert torch.cuda.is_bf16_supported(), "GPU does not support bf16"
 # create network object
-nets, use_vlm_lora = build_flow_libero_vlm_model(
+nets = build_flow_libero_vlm_model(
     args=args,
     device=device,
     action_dim=action_dim,
@@ -579,7 +579,7 @@ else:
     nets.eval()
     state_dict = eval_state_dict
     if 'vlm_encoder_lora' in state_dict:
-        if not use_vlm_lora:
+        if not hasattr(nets['vlm_encoder'], "peft_config"):
             raise RuntimeError("Checkpoint contains LoRA weights but VLM LoRA was not initialized.")
         set_peft_model_state_dict(nets['vlm_encoder'], state_dict['vlm_encoder_lora'])
     elif 'vlm_encoder' in state_dict:
