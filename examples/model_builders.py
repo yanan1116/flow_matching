@@ -66,12 +66,7 @@ def build_flow_libero_vlm_model(args, device, action_dim, eval_state_dict=None):
     vlm_encoder = _load_vlm_encoder(args.vlm_model, dtype=torch.bfloat16)
     vlm_encoder = vlm_encoder.to(device, dtype=torch.bfloat16)
 
-    train_with_vlm_lora = not args.frozen_vlm
-    load_vlm_lora = (
-        args.eval and eval_state_dict is not None and "vlm_encoder_lora" in eval_state_dict
-    )
-    use_vlm_lora = train_with_vlm_lora or load_vlm_lora
-    if use_vlm_lora:
+    if not args.frozen_vlm:
         vlm_lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             inference_mode=False,
