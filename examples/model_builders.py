@@ -110,7 +110,7 @@ def build_flow_libero_vlm_model(args, device, action_dim, eval_state_dict=None):
         nets["vlm_encoder"].eval()
         for p in nets["vlm_encoder"].parameters():
             p.requires_grad = False
-    elif train_with_vlm_lora and hasattr(nets["vlm_encoder"], "print_trainable_parameters"):
+    else:
         nets["vlm_encoder"].print_trainable_parameters()
 
     return nets, use_vlm_lora
