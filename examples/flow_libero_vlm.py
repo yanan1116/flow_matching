@@ -20,6 +20,7 @@ from tqdm import tqdm
 from diffusers.training_utils import EMAModel
 # from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data._utils.collate import default_collate
 from diffusers.optimization import get_scheduler
 from termcolor import colored
 from torchcfm.conditional_flow_matching import *
@@ -38,7 +39,7 @@ print('bddl files path:', get_libero_path("bddl_files"))
 
 from PIL import Image
 from utils import (_ensure_pil_rgb, 
-            _get_libero_env, _quat2axisangle, collate_with_task_text, get_state, 
+            _get_libero_env, _quat2axisangle, get_state, 
             hf_transform,  LIBERO_ENV_RESOLUTION, LIBERO_DUMMY_ACTION 
 )
 from model_builders import build_flow_libero_vlm_model
@@ -243,15 +244,7 @@ def _processor_call_compat(vlm_processor, texts, image_pairs, text_max_len):
             last_err = e
     raise RuntimeError(f"VLM processor input formatting failed. Last error: {last_err}")
 
-def encode_vlm_obs_features(
-    vlm_encoder,
-    vlm_processor,
-    x_main_img,
-    x_wrist_image,
-    task_texts,
-    text_max_len,
-    device,
-    task_prompt_map,):
+def _build_vlm_inputs_from_batch(vlm_processor, task_prompt_map, text_max_len, x_main_img, x_wrist_image, task_texts):
     B, O = x_main_img.shape[:2]
     main_imgs_hwc = _batch_to_hwc_uint8_np(x_main_img)
     wrist_imgs_hwc = _batch_to_hwc_uint8_np(x_wrist_image)
@@ -263,12 +256,51 @@ def encode_vlm_obs_features(
             prompts.append(prompt)
             image_pairs.append([main_imgs_hwc[b, o], wrist_imgs_hwc[b, o]])
     vlm_inputs = _processor_call_compat(vlm_processor, prompts, image_pairs, text_max_len)
+    return vlm_inputs, (B, O)
+
+
+class VLMCollator:
+    def __init__(self, vlm_processor, task_prompt_map, text_max_len, keep_raw_images=False):
+        self.vlm_processor = vlm_processor
+        self.task_prompt_map = task_prompt_map
+        self.text_max_len = text_max_len
+        self.keep_raw_images = keep_raw_images
+
+    def __call__(self, batch):
+        task_texts = [sample["task_text"] for sample in batch]
+        batch_wo_text = []
+        for sample in batch:
+            item = dict(sample)
+            item.pop("task_text")
+            batch_wo_text.append(item)
+
+        out = default_collate(batch_wo_text)
+        vlm_inputs, obs_shape = _build_vlm_inputs_from_batch(
+            vlm_processor=self.vlm_processor,
+            task_prompt_map=self.task_prompt_map,
+            text_max_len=self.text_max_len,
+            x_main_img=out["image"],
+            x_wrist_image=out["wrist_image"],
+            task_texts=task_texts,
+        )
+        out["vlm_inputs"] = vlm_inputs
+        out["vlm_obs_shape"] = obs_shape
+        if self.keep_raw_images:
+            out["task_text"] = task_texts
+        else:
+            out.pop("image")
+            out.pop("wrist_image")
+        return out
+
+
+def encode_vlm_obs_features(vlm_encoder, vlm_inputs, obs_shape, device):
     for k, v in list(vlm_inputs.items()):
         if torch.is_tensor(v):
             vlm_inputs[k] = v.to(device=device, non_blocking=True)
     out = vlm_encoder(**vlm_inputs, output_hidden_states=True, return_dict=True)
     pooled = _extract_pooled_feature(out, attention_mask=vlm_inputs.get("attention_mask"))
     pooled = pooled.to(dtype=torch.bfloat16)
+    B, O = obs_shape
     return pooled.view(B, O, -1)
 
 assert torch.cuda.is_available()
@@ -321,6 +353,12 @@ task_map = {row["task_index"]: row["task"] for row in meta}
 task_texts = [task_map[i] for i in sorted(task_map.keys())]
 vlm_processor = AutoProcessor.from_pretrained(args.vlm_model, trust_remote_code=True)
 task_prompt_map = _build_task_prompt_map(vlm_processor, task_texts)
+vlm_collator = VLMCollator(
+    vlm_processor=vlm_processor,
+    task_prompt_map=task_prompt_map,
+    text_max_len=args.text_max_len,
+    keep_raw_images=(args.debug or args.save_image),
+)
 base_ds = base_ds.with_transform(hf_transform)
 ds = LiberoWindowedDataset(base_ds, 
                            horizon=args.pred_horizon, 
@@ -335,7 +373,7 @@ dataloader_kwargs = dict(
     num_workers=args.num_workers,
     pin_memory=True,
     persistent_workers=(args.num_workers > 0),
-    collate_fn=collate_with_task_text,
+    collate_fn=vlm_collator,
 )
 if args.num_workers > 0:
     dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -345,10 +383,15 @@ batch = next(iter(dataloader))
 print(batch.keys())
 print('actions:', batch["actions"].shape)       # torch.Size([64, 16, 7])
 print('state:', batch["state"].shape)         # torch.Size([64, 1, 8])
-print('image:', batch["image"].shape)         # torch.Size([64, 1, 256, 256, 3])
-print('wrist_image:', batch["wrist_image"].shape)   # torch.Size([64, 1, 256, 256, 3])
-print('task_text:', len(batch['task_text']))
-assert isinstance(batch["task_text"], list)
+if "image" in batch:
+    print('image:', batch["image"].shape)         # torch.Size([64, 1, 256, 256, 3])
+    print('wrist_image:', batch["wrist_image"].shape)   # torch.Size([64, 1, 256, 256, 3])
+if "task_text" in batch:
+    print('task_text:', len(batch['task_text']))
+    assert isinstance(batch["task_text"], list)
+for k, v in batch["vlm_inputs"].items():
+    if torch.is_tensor(v):
+        print(f'vlm_inputs[{k}]:', v.shape, v.dtype)
 # for tt in batch['task_text']:
 #     print(tt)
 
@@ -425,12 +468,12 @@ if not args.eval_cp:
                 batch_state_max = batch['state'].max()
                 assert batch_state_min >= -3.14*2 and batch_state_max <= 3.14*2, f'state range error: {batch_state_min} {batch_state_max}'
 
-            x_main_img = batch['image']
-            x_wrist_image = batch['wrist_image']
             x_pos = batch['state'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
             x_traj = batch['actions'].to(device, non_blocking=True).to(dtype=torch.bfloat16)
 
             if args.debug:
+                x_main_img = batch['image']
+                x_wrist_image = batch['wrist_image']
                 assert x_pos.dtype == torch.bfloat16 and x_traj.dtype == torch.bfloat16
                 
             # print('train x_main_img:', x_main_img.shape)
@@ -458,24 +501,16 @@ if not args.eval_cp:
                 with torch.inference_mode():
                     vlm_feat = encode_vlm_obs_features(
                         vlm_encoder=nets['vlm_encoder'],
-                        vlm_processor=vlm_processor,
-                        x_main_img=x_main_img,
-                    x_wrist_image=x_wrist_image,
-                    task_texts=batch["task_text"],
-                    text_max_len=args.text_max_len,
-                    device=device,
-                    task_prompt_map=task_prompt_map,
-                )
+                        vlm_inputs=batch["vlm_inputs"],
+                        obs_shape=batch["vlm_obs_shape"],
+                        device=device,
+                    )
             else:
                 vlm_feat = encode_vlm_obs_features(
                     vlm_encoder=nets['vlm_encoder'],
-                    vlm_processor=vlm_processor,
-                    x_main_img=x_main_img,
-                    x_wrist_image=x_wrist_image,
-                    task_texts=batch["task_text"],
-                    text_max_len=args.text_max_len,
+                    vlm_inputs=batch["vlm_inputs"],
+                    obs_shape=batch["vlm_obs_shape"],
                     device=device,
-                    task_prompt_map=task_prompt_map,
                 )
             if vlm_feat.device != x_pos.device:
                 vlm_feat = vlm_feat.to(device=x_pos.device, non_blocking=True)
@@ -689,15 +724,19 @@ else:
                     assert x_main_img.shape == (B, args.obs_horizon, 256, 256, 3) == x_wrist_image.shape
                     assert x_pos.shape == (B, args.obs_horizon, 8)
                     with torch.no_grad():
-                        vlm_feat = encode_vlm_obs_features(
-                            vlm_encoder=nets['vlm_encoder'],
+                        vlm_inputs, obs_shape = _build_vlm_inputs_from_batch(
                             vlm_processor=vlm_processor,
+                            task_prompt_map=task_prompt_map,
+                            text_max_len=args.text_max_len,
                             x_main_img=x_main_img,
                             x_wrist_image=x_wrist_image,
                             task_texts=[task_description],
-                            text_max_len=args.text_max_len,
+                        )
+                        vlm_feat = encode_vlm_obs_features(
+                            vlm_encoder=nets['vlm_encoder'],
+                            vlm_inputs=vlm_inputs,
+                            obs_shape=obs_shape,
                             device=device,
-                            task_prompt_map=task_prompt_map,
                         )
                         if vlm_feat.device != x_pos.device:
                             vlm_feat = vlm_feat.to(device=x_pos.device, non_blocking=True)

@@ -7,3 +7,4 @@ logs/
 __pycache__/
 *.pyc
 *.pkl
+examples/__pycache__/*.pyc
