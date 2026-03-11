@@ -82,11 +82,8 @@ else:
     action_dim = 7
 
 
-dataset = LeRobotDataset.create(
-    repo_id=REPO_NAME,
-    robot_type="panda",
-    fps=10,
-    features={
+
+features={
         "image": {
             "dtype": "image",
             "shape": image_shape,
@@ -107,7 +104,20 @@ dataset = LeRobotDataset.create(
             "shape": (action_dim,),
             "names": ["actions"],
         },
-    },
+    }
+
+if 'robocasa' in args.repo or 'mimicgen' in args.repo or 'robomimic' in args.repo:
+    features["instruction"] = {
+        "dtype": "string",
+        "shape": (1,),
+        "names": ["instruction"]}
+
+
+dataset = LeRobotDataset.create(
+    repo_id=REPO_NAME,
+    robot_type="panda",
+    fps=10,
+    features= features,
     image_writer_threads=10,
     image_writer_processes=5,
 )
@@ -315,12 +325,15 @@ elif 'robocasa' in args.repo:
     }
     task_to_description = task_to_description_atomic | task_to_description_composite
 
-    hdf5_files_single_stage = glob.glob("/home/yanan/robotics/robocasa/datasets/v0.1/single_stage/*/*/*/demo_gentex_im128_randcams.hdf5")
-    hdf5_files_multi_stage = glob.glob("/home/yanan/robotics/robocasa/datasets/v0.1/multi_stage/*/*/*/demo_im128.hdf5")
+    hdf5_files_single_stage = glob.glob("/home/ubuntu/robotics/robocasa_dataset/v0.1/single_stage/*/*/*/demo_gentex_im128_randcams.hdf5")
+    hdf5_files_multi_stage = glob.glob("/home/ubuntu/robotics/robocasa_dataset/v0.1/multi_stage/*/*/*/demo_im128.hdf5")
     hdf5_files = hdf5_files_multi_stage + hdf5_files_single_stage
     random.shuffle(hdf5_files)
+    assert len(hdf5_files) > 10
+    print('hdf5_files_multi_stage cnt:', len(hdf5_files_multi_stage))
+    print('hdf5_files_single_stage cnt:', len(hdf5_files_single_stage))
 
-    for file in hdf5_files[:1]:
+    for file in hdf5_files:
         assert os.path.exists(file), f"File not found: {file}"
         
         task = file.split('/2024')[0].split('/')[-1]
@@ -396,6 +409,7 @@ elif 'robocasa' in args.repo:
                             "wrist_image": robot0_eye_in_hand_image,
                             "state": ee_state.astype(np.float32),
                             "actions": action.astype(np.float32), 
+                            "instruction": task_to_description[task],
                             "task": task_to_description[task]
                         }
                     )                
@@ -474,15 +488,14 @@ elif  'robomimic' in args.repo:
                                 "wrist_image": robot0_eye_in_hand_image,
                                 "state": ee_state.astype(np.float32),
                                 "actions": action.astype(np.float32), 
-                                "task": task_instruction[task]
+                                "task": task_instruction[task],
+                                "instruction": task_instruction[task]
                             }
                         )                
         
                     dataset.save_episode()
                     print('STATS---> num_episodes:', dataset.num_episodes, 'total frames:', len(dataset))
                     print()
-
-
 
 elif  'mimicgen' in args.repo:
     files = glob.glob("/mnt/disk1t/mimicgen_datasets/source/*.hdf5")
@@ -557,7 +570,8 @@ elif  'mimicgen' in args.repo:
                             "wrist_image": robot0_eye_in_hand_image,
                             "state": ee_state.astype(np.float32),
                             "actions": action.astype(np.float32), 
-                            "task": task_prompt
+                            "task": task_prompt,
+                            "instruction": task_prompt
                         }
                     )                
     

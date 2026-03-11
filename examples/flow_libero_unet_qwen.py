@@ -106,6 +106,7 @@ parser.add_argument("--ema", action="store_true")
 parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--prefetch_factor", type=int, default=2)
 parser.add_argument("--disable_text_input", action='store_true')
+parser.add_argument("--suite", type=str, default="all", choices=["all", "libero_spatial", "libero_object", "libero_goal", "libero_10"])
 args = parser.parse_args() 
 
 if args.disable_text_input:
@@ -488,7 +489,9 @@ else :
 
         if task_suite_name in ['libero_90', 'libero_100']:
             continue   
-        
+        if args.suite != 'all' and task_suite_name != args.suite:
+            continue
+
         np.random.seed(random.randint(1, 10000))
         task_suite = benchmark_dict[task_suite_name]()
 
