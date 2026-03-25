@@ -5,9 +5,9 @@ sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
 
-LIBERO_ROOT = "../LIBERO"
-if LIBERO_ROOT not in sys.path:
-    sys.path.append(LIBERO_ROOT)
+# LIBERO_ROOT = "../LIBERO"
+# if LIBERO_ROOT not in sys.path:
+#     sys.path.append(LIBERO_ROOT)
     
     
 import os

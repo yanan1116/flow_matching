@@ -10,9 +10,9 @@ sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
 
-LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
-if LIBERO_ROOT not in sys.path:
-    sys.path.append(LIBERO_ROOT)
+# LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
+# if LIBERO_ROOT not in sys.path:
+#     sys.path.append(LIBERO_ROOT)
        
 import numpy as np
 import torch

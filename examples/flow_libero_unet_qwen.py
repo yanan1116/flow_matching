@@ -4,9 +4,9 @@ sys.dont_write_bytecode = True
 sys.path.append('./external/models')
 sys.path.append('./external')
 
-LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
-if LIBERO_ROOT not in sys.path:
-    sys.path.append(LIBERO_ROOT)
+# LIBERO_ROOT = "/home/yanan/robotics/LIBERO"
+# if LIBERO_ROOT not in sys.path:
+#     sys.path.append(LIBERO_ROOT)
     
     
 import os
@@ -522,7 +522,11 @@ else :
             task = task_suite.get_task(task_id)
 
             # Initialize LIBERO environment and task description
-            env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, random.randint(1, 10000))
+            try:
+                env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, random.randint(1, 10000))
+            except Exception as e:
+                print('_get_libero_env error:', e)
+                continue
 
             if args.debug:
                 print(f'debug mode --> task_id:{task_id}-->{task_description}')
