@@ -59,7 +59,7 @@ from utils import (
     collate_with_task_text,
     get_state,
     hf_transform,
-    eval_epoch_milestones, LIBERO_ENV_RESOLUTION, LIBERO_DUMMY_ACTION
+    eval_epoch_milestones, LIBERO_ENV_RESOLUTION, LIBERO_DUMMY_ACTION, vanilla_task_descriptions
 )
 
 benchmark_dict = benchmark.get_benchmark_dict()
@@ -107,6 +107,7 @@ parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--prefetch_factor", type=int, default=2)
 parser.add_argument("--disable_text_input", action='store_true')
 parser.add_argument("--suite", type=str, default="all", choices=["all", "libero_spatial", "libero_object", "libero_goal", "libero_10"])
+parser.add_argument("--plus", action="store_true")
 args = parser.parse_args() 
 
 if args.disable_text_input:
@@ -533,7 +534,13 @@ else :
 
             # Start episodes
             print(f'task_id:{task_id} task_description:{task_description}')
-            
+            if args.plus:
+                desc_match = [desc for desc in vanilla_task_descriptions if task_description.startswith(desc) ]
+                assert len(desc_match) == 1 
+                print(f'task_description ({task_description}) set to vanilla:{desc_match[0]}')
+                task_description = desc_match[0]
+                
+                
             # Get default LIBERO initial states
             initial_states = task_suite.get_task_init_states(task_id)
             if len(initial_states) < 50:
