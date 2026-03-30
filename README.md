@@ -1,15 +1,8 @@
 # Train flow matching action expert for VLA robotic manipulation in simulation environment
 
-![pipeline](images/overall.png "overall")
-
-
-<p align="center">
-<img src="images/flow.gif" width="900" height="270"/>
-</p>
-
 ## Key components
 🔬 **This repo contains** \
-Training and evaluation examples of using flow matching on Robomimic, PushT, Libero and Franka Kitchen benchmarks. Modified from paper of `Affordance-based Robot Manipulation with Flow Matching`( https://hri-eu.github.io/flow-matching-policy/) with bugs fixed and more features.
+Training and evaluation examples of using flow matching on Robomimic, PushT, Libero and Franka Kitchen benchmarks. Modified from paper of `Affordance-based Robot Manipulation with Flow Matching`( https://hri-eu.github.io/flow-matching-policy/) with bugs fixed, more features and more comprehensive experiments.
 
 🌷 **Getting Started**
 🚀 Install the Python dependencies: `pip install -r requirements.txt`
@@ -88,14 +81,17 @@ Refer to the original MolmoAct dataset: `https://huggingface.co/datasets/allenai
 
 
 
-📈 **Performance on vanilla LIBERO**
-Without using VLM, just vanilla flow-matching model without fine-tuning of textual encoder, can reach ~85% success rate average across four benchmark suites: 
-```
-libero_spatial
-libero_object
-libero_goal
-libero_10
-```
+⚙️ **Benchmark: LIBERO**
+
+In the experiments, `LIBERO` is used as benchmark to evaluate the success rate on the rollouts.  Each time, an LIBERO environment is initialized with some randomness seed to make it a bit various. Then the model checkpoint is loaded and return action (7-dimension) given state observations. Finally, either the trajectory is judged as success or break the max iteration limit which is flagged as failure (model does not finish the job given limited steps). 
+
+To fully reconstruct the anaconda environment, refer to file `environment.yml`.
+
+
+📈 **Findings**
+
+Without using VLM, just vanilla flow-matching model without pre-training or fine-tuning, equipped with an off-the-shelf text encoder LLM ( for example, `Qwen/Qwen3-0.6B` ), can easily reach ~85% success rate average across four benchmark suites: `libero_spatial libero_object libero_goal libero_10` from original LIBERO benchmark (`https://libero-project.github.io/datasets`) which is widely tested in current VLAs papers.
+
 
 | Epoch | Success Rate (%) |
 |------:|-----------------:|
@@ -114,6 +110,11 @@ libero_10
 | 2000  | 85.4             |
 
 
+To systematically expose the hidden vulnerabilities of VLA models through comprehensive robustness evaluation across seven perturbation dimensions, we can also test the same model checkpoint on this enhanced benchmark  `LIBERO PLUS`("In-depth Robustness Analysis for Vision-Language-Action Models" [https://github.com/sylvestf/LIBERO-plus]).
 
-However, if the vanilla LIBERO is replaced with `LIBERO PLUS`([https://github.com/sylvestf/LIBERO-plus]) then the success rate is very low.
+In vanilla LIBERO, before evaluation, we can set `export PYTHONPATH=$PYTHONPATH:~/robotics/LIBERO; ln -sf ~/.libero/config_libero.yaml ~/.libero/config.yaml`
+to use LIBERO-PLUS, just install it from source and set `export PYTHONPATH=$PYTHONPATH:~/robotics/LIBERO-plus; ln -sf ~/.libero/config_libero_plus.yaml ~/.libero/config.yaml`
 
+However, This is a more challenging benchmark that introduces more tasks spanning multiple dimensions: Objects Layout, Camera Viewpoints, Robot Initial States, Language Instructions, Light Conditions, Background Textures, Sensor Noise. 
+
+(results are calculating, coming soon)
