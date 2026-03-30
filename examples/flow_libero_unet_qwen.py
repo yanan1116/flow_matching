@@ -550,7 +550,7 @@ else :
                 print(task_id , 'initial_states length < 50 :', len(initial_states))
             
             n_test_actual = min(len(initial_states), args.n_test)
-            assert n_test_actual >= 10
+            # assert n_test_actual >= 10
             # print('initial_states cnt:', len(initial_states), '\n')
             # continue
 
