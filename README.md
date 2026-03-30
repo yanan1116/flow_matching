@@ -18,6 +18,8 @@ Training and evaluation examples of using flow matching on Robomimic, PushT, Lib
 example :
 The training procedure will save checkpoints at some intervals to local folder `checkpoints`
 
+
+Kick off training:
 ```bash
 python examples/flow_libero_unet_qwen.py \
 --save_cp 	\
@@ -29,7 +31,11 @@ Then with the saved checkpoints, do evaluation on libero or libero-plus
 python examples/flow_libero_unet_qwen.py \
 --eval_cp checkpoints/libero/unet_qwen/cp-frozen_text_model-100.pth
 ```
+Here just the `eval_cp` controls if it goes to training mode or evaluation mode.
 
+
+
+---
 
 Train with CoT (parameters need to be tuned)
 ```bash

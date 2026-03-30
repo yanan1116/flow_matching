@@ -108,6 +108,7 @@ parser.add_argument("--prefetch_factor", type=int, default=2)
 parser.add_argument("--disable_text_input", action='store_true')
 parser.add_argument("--suite", type=str, default="all", choices=["all", "libero_spatial", "libero_object", "libero_goal", "libero_10"])
 parser.add_argument("--plus", action="store_true")
+parser.add_argument("--plus_shuffle", action="store_true")
 args = parser.parse_args() 
 
 if args.disable_text_input:
@@ -512,7 +513,9 @@ else :
             raise ValueError(f"Unknown task suite: {task_suite_name}")
         
         task_ll = list(range(task_suite.n_tasks))
-        # random.shuffle(task_ll)
+        
+        if args.plus_shuffle:
+            random.shuffle(task_ll)
         
         for task_id in task_ll:
             if args.debug:
@@ -534,11 +537,11 @@ else :
 
             # Start episodes
             print(f'task_id:{task_id} task_description:{task_description}')
-            if args.plus:
-                desc_match = [desc for desc in vanilla_task_descriptions if task_description.startswith(desc) ]
-                assert len(desc_match) == 1 
-                print(f'task_description ({task_description}) set to vanilla:{desc_match[0]}')
-                task_description = desc_match[0]
+            # if args.plus:
+            #     desc_match = [desc for desc in vanilla_task_descriptions if task_description.startswith(desc) ]
+            #     assert len(desc_match) == 1 , f'desc_match: {len(desc_match)}   task_description ({task_description}) set to vanilla:{desc_match[0]}'
+     
+            #     task_description = desc_match[0]
                 
                 
             # Get default LIBERO initial states
