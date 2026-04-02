@@ -536,13 +536,21 @@ else :
                 print(f'debug mode --> task_id:{task_id}-->{task_description}')
 
             # Start episodes
-            print(f'task_id:{task_id} task_description:{task_description}')
-            # if args.plus:
-            #     desc_match = [desc for desc in vanilla_task_descriptions if task_description.startswith(desc) ]
-            #     assert len(desc_match) == 1 , f'desc_match: {len(desc_match)}   task_description ({task_description}) set to vanilla:{desc_match[0]}'
-     
-            #     task_description = desc_match[0]
+            print(f'task_id:{task_id} original task_description:{task_description}')
+            if args.plus:
                 
+                desc_match = [desc for desc in vanilla_task_descriptions if task_description.startswith(desc) ]
+                
+                if len(desc_match) > 1:
+                    print('desc_match_error:', desc_match)
+                    continue
+                elif len(desc_match) == 0:
+                    print('desc_match_error: no match')
+                    continue
+                else:
+                    print('desc_match:', desc_match[0])
+                    task_description = desc_match[0]
+          
                 
             # Get default LIBERO initial states
             initial_states = task_suite.get_task_init_states(task_id)
