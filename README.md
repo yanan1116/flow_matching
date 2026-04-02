@@ -123,4 +123,4 @@ to use LIBERO-PLUS, just install it from source and set `export PYTHONPATH=$PYTH
 
 However, This is a more challenging benchmark that introduces more tasks spanning multiple dimensions: Objects Layout, Camera Viewpoints, Robot Initial States, Language Instructions, Light Conditions, Background Textures, Sensor Noise. 
 
-(results are calculating, coming soon)
+Evaluating the checkpoint of 2000 on LIBERO-PLUS, the average success rate is around 23.4%, which is a significant drop compared to vanilla LIBERO.
